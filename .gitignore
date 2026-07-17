@@ -1,0 +1,44 @@
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Large or licensed assets are linked locally and never committed.
+data/
+models_hf/
+toolhcl_links/
+toolhcl_ewcdr_data/
+toolhcl_ewcdr_pure_cache*
+artifacts/
+
+# Generated experiment artifacts.
+toolhcl_ewcdr_runs*
+checkpoints/
+logs/
+wandb/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Archived migration prototype; the published baseline is toolhcl_ewcdr_pure.
+toolhcl_ewcdr/
+configs/toolhcl_ewcdr.yaml
+configs/toolhcl_ewcdr_converged.yaml
+configs/toolhcl_ewcdr_fast.yaml
+scripts/run_toolhcl_ewcdr.sh
+scripts/eval_toolhcl_ewcdr.sh
+scripts/smoke_test_toolhcl_ewcdr.sh
+scripts/run_toolhcl_ewcdr_converged.sh
+scripts/eval_toolhcl_ewcdr_converged.sh
+scripts/smoke_test_toolhcl_ewcdr_converged.sh
+scripts/run_toolhcl_ewcdr_fast.sh
+scripts/eval_toolhcl_ewcdr_fast.sh
+scripts/smoke_test_toolhcl_ewcdr_fast.sh
