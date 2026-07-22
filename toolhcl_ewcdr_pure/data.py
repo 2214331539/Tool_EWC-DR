@@ -327,6 +327,62 @@ def sample_by_tool(
     }
 
 
+def stratified_train_validation_indices(
+    samples: Sequence[PureSample], *, validation_fraction: float, seed: int
+) -> tuple[list[int], list[int], dict[str, Any]]:
+    """Create a deterministic tool-ID-stratified holdout without losing train-only tools."""
+    fraction = float(validation_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"validation_fraction must be between 0 and 1, got {fraction}")
+
+    groups: dict[int, list[int]] = {}
+    for index, sample in enumerate(samples):
+        groups.setdefault(int(sample.tool_id), []).append(index)
+
+    rng = random.Random(int(seed))
+    train_indices: list[int] = []
+    validation_indices: list[int] = []
+    singleton_tools = 0
+    for tool_id in sorted(groups):
+        indices = list(groups[tool_id])
+        rng.shuffle(indices)
+        if len(indices) == 1:
+            singleton_tools += 1
+            train_indices.extend(indices)
+            continue
+        validation_count = max(1, int(round(len(indices) * fraction)))
+        validation_count = min(validation_count, len(indices) - 1)
+        validation_indices.extend(indices[:validation_count])
+        train_indices.extend(indices[validation_count:])
+
+    train_indices.sort()
+    validation_indices.sort()
+    if set(train_indices) & set(validation_indices):
+        raise AssertionError("Training and validation indices overlap")
+    if sorted(train_indices + validation_indices) != list(range(len(samples))):
+        raise AssertionError("Training/validation split does not cover the full input")
+
+    train_tools = {int(samples[index].tool_id) for index in train_indices}
+    validation_tools = {int(samples[index].tool_id) for index in validation_indices}
+    available_tools = len(groups)
+    if len(train_tools) != available_tools:
+        raise AssertionError("At least one tool was removed entirely from the training partition")
+    report = {
+        "strategy": f"tool_id_stratified_holdout(seed={seed})",
+        "validation_fraction_requested": fraction,
+        "full_samples": len(samples),
+        "train_samples": len(train_indices),
+        "validation_samples": len(validation_indices),
+        "validation_fraction_actual": len(validation_indices) / max(1, len(samples)),
+        "available_tools": available_tools,
+        "train_tools": len(train_tools),
+        "validation_tools": len(validation_tools),
+        "singleton_tools_train_only": singleton_tools,
+        "validation_tool_coverage_percent": 100.0 * len(validation_tools) / max(1, available_tools),
+    }
+    return train_indices, validation_indices, report
+
+
 def write_data_audit(config: Mapping[str, Any], output_path: Path) -> dict[str, Any]:
     records = load_stage_tools(config)
     audit: dict[str, Any] = {"tool_counts": {}, "splits": {}, "global_eval": {}}

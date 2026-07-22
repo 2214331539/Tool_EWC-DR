@@ -27,6 +27,7 @@ from .model import (
     named_trainable_parameters,
     save_checkpoint,
 )
+from .train import classification_loss
 from .utils import EXPECTED_TOOL_COUNTS, STAGES, dataloader_options, load_config, resolve_device, save_json, set_seed
 
 
@@ -101,6 +102,7 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
         label_checks[stage] = rows
 
     structure: dict[str, dict] = {}
+    classification_objective_check: dict[str, float | int | str] = {}
     with tempfile.TemporaryDirectory(prefix="pure_ewcdr_verify_") as temporary:
         previous_path = None
         for stage in STAGES:
@@ -118,6 +120,26 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
             structure[stage] = {"trainable": names, "logits_shape": list(logits.shape)}
             previous_path = Path(temporary) / f"{stage}.pt"
             save_checkpoint(previous_path, model, stage=stage, epoch=0, training_history=[], metadata={"verification": True})
+
+        task1_model = build_retriever(config, "task1", encoder=None)
+        task1_logits = task1_model.forward_hidden(torch.randn(2, int(config["model"]["hidden_size"])))
+        task1_targets = torch.tensor([11112, 11751], dtype=torch.long)
+        task1_loss, task1_candidates = classification_loss(task1_logits, task1_targets)
+        task1_loss.backward()
+        old_grad = task1_model.classifier.weight.grad[:11112]
+        new_grad = task1_model.classifier.weight.grad[11112:]
+        old_nonzero = int(torch.count_nonzero(old_grad).item())
+        new_nonzero = int(torch.count_nonzero(new_grad).item())
+        if old_nonzero == 0:
+            raise AssertionError("All-visible CE produced no gradients for historical classifier rows")
+        if new_nonzero == 0:
+            raise AssertionError("All-visible CE produced no gradients for new classifier rows")
+        classification_objective_check = {
+            "scope": "all_visible",
+            "candidates": task1_candidates,
+            "old_classifier_gradient_nonzero": old_nonzero,
+            "new_classifier_gradient_nonzero": new_nonzero,
+        }
 
         encoder = load_frozen_encoder(config, device)
         model = build_retriever(config, "base", encoder=encoder).to(device)
@@ -169,6 +191,7 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
         "import_graph": import_graph,
         "sampling": sampling_report,
         "structure": structure,
+        "classification_objective_check": classification_objective_check,
         "label_checks": label_checks,
         "full_encoder_hidden_shape": [2, 4096],
         "importance": importance_report,

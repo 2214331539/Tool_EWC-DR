@@ -1,0 +1,82 @@
+{
+  "selection_pass": "90% tool-ID-stratified train partition",
+  "final_pass": "100% original train split from a fresh initialization",
+  "test_usage": "The test/global splits are used only after final training",
+  "metric": "harmonic mean of historical-task mean Recall@1 and current-task Recall@1",
+  "selected_epochs": {
+    "base": 7,
+    "task1": 2,
+    "task2": 1,
+    "task3": 2
+  },
+  "selection_output": "/data/ptf/toolhcl_ewcdr_pure_artifacts/runs/toolhcl_ewcdr_runs_pure_validated_20260719_1101_selection",
+  "validation": {
+    "enabled": true,
+    "config": {
+      "enabled": true,
+      "fraction": 0.1,
+      "seed": 42,
+      "eval_every": 1,
+      "patience": 5,
+      "min_delta": 0.05,
+      "selection_metric": "harmonic_mean_historical_current_recall_at_1",
+      "batch_size": 512,
+      "num_workers": 0,
+      "pin_memory": true
+    },
+    "splits": {
+      "base": {
+        "strategy": "tool_id_stratified_holdout(seed=42)",
+        "validation_fraction_requested": 0.1,
+        "full_samples": 232982,
+        "train_samples": 208552,
+        "validation_samples": 24430,
+        "validation_fraction_actual": 0.10485788601694551,
+        "available_tools": 10889,
+        "train_tools": 10889,
+        "validation_tools": 10039,
+        "singleton_tools_train_only": 850,
+        "validation_tool_coverage_percent": 92.19395720451833
+      },
+      "task1": {
+        "strategy": "tool_id_stratified_holdout(seed=42)",
+        "validation_fraction_requested": 0.1,
+        "full_samples": 13157,
+        "train_samples": 11772,
+        "validation_samples": 1385,
+        "validation_fraction_actual": 0.10526715816675535,
+        "available_tools": 639,
+        "train_tools": 639,
+        "validation_tools": 594,
+        "singleton_tools_train_only": 45,
+        "validation_tool_coverage_percent": 92.95774647887323
+      },
+      "task2": {
+        "strategy": "tool_id_stratified_holdout(seed=42)",
+        "validation_fraction_requested": 0.1,
+        "full_samples": 13932,
+        "train_samples": 12463,
+        "validation_samples": 1469,
+        "validation_fraction_actual": 0.10544071202985932,
+        "available_tools": 639,
+        "train_tools": 639,
+        "validation_tools": 595,
+        "singleton_tools_train_only": 44,
+        "validation_tool_coverage_percent": 93.11424100156495
+      },
+      "task3": {
+        "strategy": "tool_id_stratified_holdout(seed=42)",
+        "validation_fraction_requested": 0.1,
+        "full_samples": 12989,
+        "train_samples": 11608,
+        "validation_samples": 1381,
+        "validation_fraction_actual": 0.10632073292786204,
+        "available_tools": 643,
+        "train_tools": 643,
+        "validation_tools": 588,
+        "singleton_tools_train_only": 55,
+        "validation_tool_coverage_percent": 91.44634525660965
+      }
+    }
+  }
+}

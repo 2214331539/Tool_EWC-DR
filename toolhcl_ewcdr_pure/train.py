@@ -6,7 +6,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -14,8 +14,16 @@ from torch.optim import AdamW
 from torch.utils.data import Subset
 from tqdm import tqdm
 
-from .cache import build_feature_cache, load_feature_dataset
-from .data import build_global_eval_samples, build_stage_samples, load_stage_tools, make_loader, sample_by_tool
+from .cache import build_feature_cache, cache_is_valid, load_feature_dataset
+from .data import (
+    FeatureDataset,
+    build_global_eval_samples,
+    build_stage_samples,
+    load_stage_tools,
+    make_loader,
+    sample_by_tool,
+    stratified_train_validation_indices,
+)
 from .ewcdr import (
     accumulate_online,
     compute_importance,
@@ -34,6 +42,7 @@ from .model import (
     save_checkpoint,
     trainable_summary,
 )
+from .metrics import RetrievalMetrics
 from .utils import (
     STAGES,
     autocast_context,
@@ -41,6 +50,7 @@ from .utils import (
     ensure_dir,
     gpu_memory_summary,
     load_config,
+    load_json,
     project_root,
     resolve_device,
     resolve_path,
@@ -58,8 +68,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=("seq_ft", "ewc", "ewc_dr"), default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--stages", default=None)
+    parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--importance_max_samples", type=int, default=None)
+    parser.add_argument("--ewc_lambda", type=float, default=None)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -73,10 +85,20 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
         config["runtime"]["resume"] = True
     if args.stages:
         config["training"]["stages"] = [value.strip() for value in args.stages.split(",") if value.strip()]
+    if args.epochs is not None:
+        if args.epochs <= 0:
+            raise ValueError("--epochs must be positive")
+        config["training"]["stage_epochs"] = {
+            stage: {"min": args.epochs, "max": args.epochs} for stage in STAGES
+        }
     if args.max_train_samples is not None:
         config["training"]["max_train_samples"] = args.max_train_samples
     if args.importance_max_samples is not None:
         config["ewcdr"]["importance_max_samples"] = args.importance_max_samples
+    if args.ewc_lambda is not None:
+        if args.ewc_lambda < 0:
+            raise ValueError("--ewc_lambda must be non-negative")
+        config["ewcdr"]["lambda"] = args.ewc_lambda
     if args.smoke:
         config["runtime"]["smoke"] = True
         config["training"]["stages"] = ["base", "task1"]
@@ -130,24 +152,42 @@ def _prepare_caches(
         )
         stage_samples[stage] = samples
         parse_audit["train"][stage] = details
-    eval_limit = config.get("evaluation", {}).get("eval_limit")
-    global_samples, global_details = build_global_eval_samples(config, records=records, max_samples=eval_limit)
-    parse_audit["global_eval"] = global_details
+    prepare_global_eval = bool(config.get("cache", {}).get("prepare_global_eval", True))
+    global_samples: list[Any] = []
+    if prepare_global_eval:
+        eval_limit = config.get("evaluation", {}).get("eval_limit")
+        global_samples, global_details = build_global_eval_samples(config, records=records, max_samples=eval_limit)
+        parse_audit["global_eval"] = global_details
+    else:
+        parse_audit["global_eval"] = {"skipped_during_training": True}
 
     cache_root = resolve_path(config["cache"]["root"], project_root(config))
     ensure_dir(cache_root)
     cache_specs = [(f"{stage}_train", stage_samples[stage]) for stage in selected_stages]
-    cache_specs.append(("global_eval", global_samples))
-    needs_encoder = True
+    if prepare_global_eval:
+        cache_specs.append(("global_eval", global_samples))
     encoder = None
     cache_metadata: dict[str, Any] = {}
     options = dataloader_options(config, "cache")
+    hidden_size = int(config["model"].get("hidden_size", 4096))
+    max_length = int(config["model"].get("max_length", 512))
+    missing_specs: list[tuple[str, Any]] = []
+    for name, samples in cache_specs:
+        cache_dir = cache_root / name
+        if cache_is_valid(cache_dir, samples, hidden_size, max_length):
+            manifest = load_json(cache_dir / "manifest.json")
+            cache_metadata[name] = {"path": str(cache_dir), **manifest}
+            logger.info("reusing frozen-encoder feature cache without loading LLaMA: %s", cache_dir)
+        else:
+            missing_specs.append((name, samples))
     try:
-        for name, samples in cache_specs:
-            cache_dir = cache_root / name
+        if missing_specs:
+            encoder = load_frozen_encoder(config, device)
+            logger.info("loaded complete frozen LLaMA encoder for %s missing feature cache(s)", len(missing_specs))
+        for name, samples in missing_specs:
             if encoder is None:
-                encoder = load_frozen_encoder(config, device)
-                logger.info("loaded complete frozen LLaMA encoder for deterministic feature extraction")
+                raise AssertionError("Missing feature caches require a loaded encoder")
+            cache_dir = cache_root / name
             manifest = build_feature_cache(
                 encoder,
                 samples,
@@ -186,6 +226,73 @@ def _cache_regularizer(values: Mapping[str, torch.Tensor] | None, device: torch.
     return {name: tensor.to(device=device, dtype=torch.float32) for name, tensor in values.items()}
 
 
+def classification_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Compute CE over every tool visible at the current continual stage."""
+    return F.cross_entropy(logits.float(), targets).float(), int(logits.shape[1])
+
+
+def _materialize_feature_subset(dataset: FeatureDataset, indices: Sequence[int]) -> FeatureDataset:
+    index_tensor = torch.tensor(list(indices), dtype=torch.long)
+    return FeatureDataset(
+        dataset.hidden.index_select(0, index_tensor),
+        dataset.tool_ids.index_select(0, index_tensor),
+        [dataset.source_stages[index] for index in indices],
+    )
+
+
+@torch.no_grad()
+def _evaluate_seen_validation(
+    model,
+    validation_datasets: Mapping[str, FeatureDataset],
+    seen_stages: Sequence[str],
+    config: Mapping[str, Any],
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+) -> dict[str, Any]:
+    model.eval()
+    per_stage: dict[str, Any] = {}
+    validation_config = config.get("training", {}).get("validation", {})
+    options = dataloader_options({"validation": validation_config}, "validation")
+    batch_size = int(
+        validation_config.get("batch_size", config.get("evaluation", {}).get("batch_size", 512))
+    )
+    for eval_stage in seen_stages:
+        accumulator = RetrievalMetrics((1,))
+        loader = make_loader(
+            validation_datasets[eval_stage],
+            batch_size=batch_size,
+            shuffle=False,
+            **options,
+        )
+        for batch in loader:
+            with autocast_context(device, amp_enabled, amp_dtype):
+                logits = model.forward_batch(batch, device)
+            targets = batch["tool_id"].to(device, non_blocking=True)
+            accumulator.update(logits, targets, model.num_tools)
+        per_stage[eval_stage] = accumulator.result()
+
+    current_stage = seen_stages[-1]
+    current_recall = float(per_stage[current_stage]["Recall@1"])
+    historical_values = [float(per_stage[stage]["Recall@1"]) for stage in seen_stages[:-1]]
+    historical_mean = sum(historical_values) / len(historical_values) if historical_values else current_recall
+    if historical_values:
+        denominator = historical_mean + current_recall
+        selection_score = 2.0 * historical_mean * current_recall / denominator if denominator > 0 else 0.0
+    else:
+        selection_score = current_recall
+    return {
+        "selection_metric": "harmonic_mean_historical_current_recall_at_1",
+        "selection_score": selection_score,
+        "historical_mean_recall_at_1": historical_mean,
+        "current_recall_at_1": current_recall,
+        "per_stage": per_stage,
+    }
+
+
 def train(config: dict[str, Any]) -> Path:
     root = project_root(config)
     output_dir = resolve_path(config["project"]["output_dir"], root)
@@ -205,10 +312,30 @@ def train(config: dict[str, Any]) -> Path:
     stage_samples, cache_metadata = _prepare_caches(config, selected_stages, device, logger)
     cache_root = resolve_path(config["cache"]["root"], root)
     method = str(config["ewcdr"].get("method", "ewc_dr"))
+    classification_scope = str(config["training"].get("classification_scope", "all_visible"))
+    if classification_scope != "all_visible":
+        raise ValueError("V2 requires training.classification_scope=all_visible")
     lambda_ewc = float(config["ewcdr"].get("lambda", 1000.0))
     gamma = float(config["ewcdr"].get("gamma", 1.0))
     resume = bool(config["runtime"].get("resume", False))
     save_final_importance = bool(config["ewcdr"].get("save_final_importance", False))
+    validation_config = config["training"].get("validation", {})
+    validation_enabled = bool(validation_config.get("enabled", False))
+    checkpoint_selection = str(
+        config["training"].get(
+            "checkpoint_selection", "validation" if validation_enabled else "train_loss"
+        )
+    )
+    if checkpoint_selection not in {"train_loss", "validation", "last_epoch"}:
+        raise ValueError(f"Unsupported training.checkpoint_selection: {checkpoint_selection}")
+    if checkpoint_selection == "validation" and not validation_enabled:
+        raise ValueError("Validation checkpoint selection requires training.validation.enabled=true")
+    validation_datasets: dict[str, FeatureDataset] = {}
+    validation_split_reports: dict[str, Any] = {}
+    logger.info("classification_scope=%s", classification_scope)
+    logger.info(
+        "checkpoint_selection=%s validation_enabled=%s", checkpoint_selection, validation_enabled
+    )
     previous_checkpoint: Path | None = None
     snapshot: dict[str, torch.Tensor] | None = None
     accumulated: dict[str, torch.Tensor] | None = None
@@ -234,10 +361,25 @@ def train(config: dict[str, Any]) -> Path:
                 accumulated = payload["importance_total"]
             continue
 
-        dataset, manifest = load_feature_dataset(cache_root / f"{stage}_train")
+        full_dataset, manifest = load_feature_dataset(cache_root / f"{stage}_train")
         expected_samples = len(stage_samples[stage])
-        if len(dataset) != expected_samples:
-            raise AssertionError(f"{stage} cache has {len(dataset)} rows, expected {expected_samples}")
+        if len(full_dataset) != expected_samples:
+            raise AssertionError(f"{stage} cache has {len(full_dataset)} rows, expected {expected_samples}")
+        if validation_enabled:
+            train_indices, validation_indices, split_report = stratified_train_validation_indices(
+                stage_samples[stage],
+                validation_fraction=float(validation_config.get("fraction", 0.1)),
+                seed=int(validation_config.get("seed", config["training"].get("seed", 42))),
+            )
+            dataset = Subset(full_dataset, train_indices)
+            validation_datasets[stage] = _materialize_feature_subset(full_dataset, validation_indices)
+            validation_split_reports[stage] = split_report
+            training_samples = [stage_samples[stage][index] for index in train_indices]
+            logger.info("stage=%s validation_split=%s", stage, split_report)
+        else:
+            train_indices = list(range(expected_samples))
+            dataset = full_dataset
+            training_samples = stage_samples[stage]
         model = build_retriever(config, stage, encoder=None).to(device)
         inheritance = None
         if previous_checkpoint is not None:
@@ -269,6 +411,8 @@ def train(config: dict[str, Any]) -> Path:
         best_smoothed_total = math.inf
         best_smoothed_ce = math.inf
         best_raw_total = math.inf
+        best_selection_score = -math.inf
+        best_patience_score = -math.inf
         best_epoch = -1
         stop_reason = "max_epochs_reached"
         best_path = checkpoint_dir / f".{stage}.best.pt"
@@ -287,7 +431,7 @@ def train(config: dict[str, Any]) -> Path:
                 with autocast_context(device, amp_enabled, amp_dtype):
                     logits = model.forward_batch(batch, device)
                 targets = batch["tool_id"].to(device, non_blocking=True)
-                ce_loss = F.cross_entropy(logits.float(), targets).float()
+                ce_loss, classification_candidates = classification_loss(logits, targets)
                 if stage_position == 0 or method == "seq_ft":
                     ewc_loss = torch.zeros((), device=device, dtype=torch.float32)
                 else:
@@ -324,17 +468,43 @@ def train(config: dict[str, Any]) -> Path:
                 "total_loss": totals["total"] / denominator,
                 "ewc_to_ce_ratio": (totals["ewc"] / max(totals["ce"], 1e-12)),
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                "classification_scope": classification_scope,
+                "classification_candidates": classification_candidates,
                 "batches": batches,
                 "samples": samples_seen,
                 "duration_sec": round(time.time() - epoch_started, 3),
                 "gpu_memory": gpu_memory_summary(),
                 **drift_summary(model, snapshot),
             }
+            if validation_enabled and (epoch + 1) % int(validation_config.get("eval_every", 1)) == 0:
+                validation_started = time.time()
+                row["validation"] = _evaluate_seen_validation(
+                    model,
+                    validation_datasets,
+                    selected_stages[: stage_position + 1],
+                    config,
+                    device,
+                    amp_enabled,
+                    amp_dtype,
+                )
+                row["validation_duration_sec"] = round(time.time() - validation_started, 3)
             history.append(row)
             all_epochs.append(row)
             logger.info("epoch=%s", row)
-            if row["total_loss"] < best_raw_total:
-                best_raw_total = float(row["total_loss"])
+            best_raw_total = min(best_raw_total, float(row["total_loss"]))
+            if checkpoint_selection == "validation":
+                if "validation" not in row:
+                    is_best = False
+                else:
+                    selection_score = float(row["validation"]["selection_score"])
+                    is_best = selection_score > best_selection_score
+                    if is_best:
+                        best_selection_score = selection_score
+            elif checkpoint_selection == "last_epoch":
+                is_best = True
+            else:
+                is_best = float(row["total_loss"]) <= best_raw_total
+            if is_best:
                 best_epoch = epoch + 1
                 save_checkpoint(
                     best_path,
@@ -342,9 +512,35 @@ def train(config: dict[str, Any]) -> Path:
                     stage=stage,
                     epoch=best_epoch,
                     training_history=history,
-                    metadata={"precision": precision_name, "feature_cache": str(cache_root / f"{stage}_train")},
+                    metadata={
+                        "precision": precision_name,
+                        "feature_cache": str(cache_root / f"{stage}_train"),
+                        "classification_scope": classification_scope,
+                        "classification_candidates": classification_candidates,
+                        "checkpoint_selection": checkpoint_selection,
+                        "selection_score": (
+                            row.get("validation", {}).get("selection_score")
+                            if checkpoint_selection == "validation"
+                            else None
+                        ),
+                    },
                 )
-            if len(history) >= window:
+            if validation_enabled and "validation" in row:
+                validation_delta = float(validation_config.get("min_delta", 0.05))
+                validation_score = float(row["validation"]["selection_score"])
+                if validation_score > best_patience_score + validation_delta:
+                    best_patience_score = validation_score
+                    stale = 0
+                elif epoch + 1 >= minimum_epochs:
+                    stale += 1
+                validation_patience = int(validation_config.get("patience", patience))
+                if epoch + 1 >= minimum_epochs and stale >= validation_patience:
+                    stop_reason = (
+                        "validation_converged(metric=harmonic_mean_historical_current_recall_at_1,"
+                        f"patience={validation_patience},min_delta={validation_delta})"
+                    )
+                    break
+            elif not validation_enabled and len(history) >= window:
                 smooth_total = _moving_average(history, "total_loss", window)
                 smooth_ce = _moving_average(history, "ce_loss", window)
                 total_threshold = max(absolute_delta, abs(best_smoothed_total) * relative_delta) if math.isfinite(best_smoothed_total) else 0.0
@@ -380,6 +576,14 @@ def train(config: dict[str, Any]) -> Path:
                 "completed_epochs": len(history),
                 "best_total_loss": best_raw_total,
                 "feature_cache": str(cache_root / f"{stage}_train"),
+                "classification_scope": classification_scope,
+                "classification_candidates": history[-1]["classification_candidates"],
+                "checkpoint_selection": checkpoint_selection,
+                "selection_score": (
+                    history[best_epoch - 1].get("validation", {}).get("selection_score")
+                    if checkpoint_selection == "validation"
+                    else None
+                ),
             },
         )
         best_path.unlink(missing_ok=True)
@@ -393,11 +597,12 @@ def train(config: dict[str, Any]) -> Path:
         sampling_report: dict[str, Any] | None = None
         if needs_importance:
             _, selected_indices, sampling_report = sample_by_tool(
-                stage_samples[stage],
+                training_samples,
                 max_samples=config["ewcdr"].get("importance_max_samples"),
                 seed=int(config["training"].get("seed", 42)),
             )
-            importance_dataset = Subset(dataset, selected_indices)
+            full_selected_indices = [train_indices[index] for index in selected_indices]
+            importance_dataset = Subset(full_dataset, full_selected_indices)
             importance_loader = _loader(importance_dataset, config, shuffle=False, importance=True)
             importance_started = time.time()
             current_importance, importance_report = compute_importance(
@@ -437,8 +642,13 @@ def train(config: dict[str, Any]) -> Path:
         summary = {
             "stage": stage,
             "train_samples": len(dataset),
+            "full_train_samples": len(full_dataset),
+            "validation_samples": len(validation_datasets[stage]) if validation_enabled else 0,
+            "validation_split": validation_split_reports.get(stage),
             "completed_epochs": len(history),
             "best_epoch": best_epoch,
+            "checkpoint_selection": checkpoint_selection,
+            "best_selection_score": best_selection_score if checkpoint_selection == "validation" else None,
             "stop_reason": stop_reason,
             "train_duration_sec": round(train_duration, 3),
             "importance_duration_sec": round(importance_duration, 3),
@@ -448,6 +658,8 @@ def train(config: dict[str, Any]) -> Path:
             "importance_summary": importance_report,
             "final_epoch": history[-1],
             "trainable": trainable_summary(model),
+            "classification_scope": classification_scope,
+            "classification_candidates": history[-1]["classification_candidates"],
         }
         stage_summaries = [row for row in stage_summaries if row.get("stage") != stage]
         stage_summaries.append(summary)
@@ -455,15 +667,22 @@ def train(config: dict[str, Any]) -> Path:
             output_dir / "training_summary.json",
             {
                 "method": method,
+                "classification_scope": classification_scope,
                 "hardware": _hardware(),
                 "precision": precision_name,
                 "feature_cache": cache_metadata,
+                "checkpoint_selection": checkpoint_selection,
+                "validation": {
+                    "enabled": validation_enabled,
+                    "config": dict(validation_config),
+                    "splits": validation_split_reports,
+                },
                 "stages": stage_summaries,
                 "epochs": all_epochs,
             },
         )
         previous_checkpoint = checkpoint_path
-        del dataset, loader, model
+        del dataset, full_dataset, loader, model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

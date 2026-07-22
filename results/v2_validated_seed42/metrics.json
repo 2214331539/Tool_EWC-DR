@@ -1,0 +1,336 @@
+{
+  "method": "ewc_dr",
+  "precision": "bf16",
+  "evaluation_duration_sec": 12.968,
+  "cache_manifest": {
+    "format": "pure_ewcdr_frozen_llama_features_v1",
+    "samples": 63662,
+    "hidden_size": 4096,
+    "dtype": "bfloat16",
+    "max_length": 512,
+    "sample_digest": "8ad6eeca5f7a7d1457b88b5c5ae2dbc5bbd919fddf1fa1d0237eee37a357a30c",
+    "shards": [
+      {
+        "file": "shard_00000.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00001.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00002.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00003.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00004.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00005.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00006.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00007.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00008.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00009.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00010.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00011.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00012.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00013.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00014.pt",
+        "samples": 4096
+      },
+      {
+        "file": "shard_00015.pt",
+        "samples": 2222
+      }
+    ],
+    "duration_sec": 870.699
+  },
+  "global_eval": [
+    {
+      "checkpoint": "base",
+      "eval_split": "global",
+      "samples": 63662,
+      "candidates": 11112,
+      "Recall@1": 20.428198925575696,
+      "Recall@3": 47.81659388646288,
+      "Recall@5": 57.187961421256006,
+      "NDCG@1": 20.428198925575696,
+      "NDCG@3": 36.45668086110993,
+      "NDCG@5": 40.33348723093948,
+      "MRR": 36.472038621858424,
+      "top1_pred_base_percent": 100.0,
+      "top1_pred_task1_percent": 0.0,
+      "top1_pred_task2_percent": 0.0,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 100.0
+    },
+    {
+      "checkpoint": "task1",
+      "eval_split": "global",
+      "samples": 63662,
+      "candidates": 11752,
+      "Recall@1": 6.804687254563162,
+      "Recall@3": 14.479595363010903,
+      "Recall@5": 18.400301592786906,
+      "NDCG@1": 6.804687254563162,
+      "NDCG@3": 11.253785681070658,
+      "NDCG@5": 12.868341063805977,
+      "MRR": 12.582742618475585,
+      "top1_pred_base_percent": 23.118972071251296,
+      "top1_pred_task1_percent": 76.88102792874871,
+      "top1_pred_task2_percent": 0.0,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 76.88102792874871
+    },
+    {
+      "checkpoint": "task2",
+      "eval_split": "global",
+      "samples": 63662,
+      "candidates": 12392,
+      "Recall@1": 2.8949765951430995,
+      "Recall@3": 5.734975338506487,
+      "Recall@5": 7.28063837139895,
+      "NDCG@1": 2.8949765951430995,
+      "NDCG@3": 4.538121255956906,
+      "NDCG@5": 5.174408264282395,
+      "MRR": 5.346115010498733,
+      "top1_pred_base_percent": 7.393735666488643,
+      "top1_pred_task1_percent": 5.31086048192014,
+      "top1_pred_task2_percent": 87.29540385159122,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 87.29540385159122
+    },
+    {
+      "checkpoint": "task3",
+      "eval_split": "global",
+      "samples": 63662,
+      "candidates": 13035,
+      "Recall@1": 3.0709057208381765,
+      "Recall@3": 6.265904307121987,
+      "Recall@5": 8.091168986208414,
+      "NDCG@1": 3.0709057208381765,
+      "NDCG@3": 4.919109269187811,
+      "NDCG@5": 5.666934031706302,
+      "MRR": 6.012006683214188,
+      "top1_pred_base_percent": 5.992585843988564,
+      "top1_pred_task1_percent": 0.20420344946750021,
+      "top1_pred_task2_percent": 0.029845119537557724,
+      "top1_pred_task3_percent": 93.77336558700637,
+      "top1_pred_checkpoint_stage_percent": 93.77336558700637
+    }
+  ],
+  "seen_task_matrix": [
+    {
+      "checkpoint": "base",
+      "eval_split": "base",
+      "samples": 54348,
+      "candidates": 11112,
+      "Recall@1": 23.929123426805035,
+      "Recall@3": 56.01126076396555,
+      "Recall@5": 66.98866563626996,
+      "NDCG@1": 23.929123426805035,
+      "NDCG@3": 42.70451933796976,
+      "NDCG@5": 47.245721353059345,
+      "MRR": 42.72250906647441,
+      "top1_pred_base_percent": 100.0,
+      "top1_pred_task1_percent": 0.0,
+      "top1_pred_task2_percent": 0.0,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 100.0
+    },
+    {
+      "checkpoint": "task1",
+      "eval_split": "base",
+      "samples": 54348,
+      "candidates": 11752,
+      "Recall@1": 6.48229925664238,
+      "Recall@3": 14.460513726356075,
+      "Recall@5": 18.66122028409509,
+      "NDCG@1": 6.48229925664238,
+      "NDCG@3": 11.10596326027975,
+      "NDCG@5": 12.835360889430603,
+      "MRR": 12.588616499988905,
+      "top1_pred_base_percent": 24.0432030617502,
+      "top1_pred_task1_percent": 75.9567969382498,
+      "top1_pred_task2_percent": 0.0,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 75.9567969382498
+    },
+    {
+      "checkpoint": "task1",
+      "eval_split": "task1",
+      "samples": 3052,
+      "candidates": 11752,
+      "Recall@1": 26.50720838794233,
+      "Recall@3": 44.528178243774576,
+      "Recall@5": 51.50720838794234,
+      "NDCG@1": 26.50720838794233,
+      "NDCG@3": 36.97628193726546,
+      "NDCG@5": 39.85849801709737,
+      "MRR": 38.29502965644647,
+      "top1_pred_base_percent": 10.812581913499345,
+      "top1_pred_task1_percent": 89.18741808650066,
+      "top1_pred_task2_percent": 0.0,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 89.18741808650066
+    },
+    {
+      "checkpoint": "task2",
+      "eval_split": "base",
+      "samples": 54348,
+      "candidates": 12392,
+      "Recall@1": 2.2944726576874954,
+      "Recall@3": 4.831824538161477,
+      "Recall@5": 6.121660410686686,
+      "NDCG@1": 2.2944726576874954,
+      "NDCG@3": 3.7669583908320265,
+      "NDCG@5": 4.298431164224986,
+      "MRR": 4.448269878237806,
+      "top1_pred_base_percent": 7.716935305807021,
+      "top1_pred_task1_percent": 4.986384043571061,
+      "top1_pred_task2_percent": 87.29668065062192,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 87.29668065062192
+    },
+    {
+      "checkpoint": "task2",
+      "eval_split": "task1",
+      "samples": 3052,
+      "candidates": 12392,
+      "Recall@1": 7.896461336828309,
+      "Recall@3": 13.20445609436435,
+      "Recall@5": 16.743119266055047,
+      "NDCG@1": 7.896461336828309,
+      "NDCG@3": 10.91939579612462,
+      "NDCG@5": 12.367312514453852,
+      "MRR": 12.760768680397524,
+      "top1_pred_base_percent": 3.473132372214941,
+      "top1_pred_task1_percent": 11.828309305373526,
+      "top1_pred_task2_percent": 84.69855832241153,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 84.69855832241153
+    },
+    {
+      "checkpoint": "task2",
+      "eval_split": "task2",
+      "samples": 3206,
+      "candidates": 12392,
+      "Recall@1": 11.072988147223956,
+      "Recall@3": 19.401122894572676,
+      "Recall@5": 24.859638178415473,
+      "NDCG@1": 11.072988147223956,
+      "NDCG@3": 15.861891807798884,
+      "NDCG@5": 18.10885968984698,
+      "MRR": 18.60384783444372,
+      "top1_pred_base_percent": 4.8034934497816595,
+      "top1_pred_task1_percent": 4.741110417966313,
+      "top1_pred_task2_percent": 90.45539613225203,
+      "top1_pred_task3_percent": 0.0,
+      "top1_pred_checkpoint_stage_percent": 90.45539613225203
+    },
+    {
+      "checkpoint": "task3",
+      "eval_split": "base",
+      "samples": 54348,
+      "candidates": 13035,
+      "Recall@1": 1.9485537646279532,
+      "Recall@3": 4.611025244719217,
+      "Recall@5": 6.233900051519836,
+      "NDCG@1": 1.9485537646279532,
+      "NDCG@3": 3.4864902053262226,
+      "NDCG@5": 4.150025496869246,
+      "MRR": 4.555932120998903,
+      "top1_pred_base_percent": 6.379259586369324,
+      "top1_pred_task1_percent": 0.16927945830573343,
+      "top1_pred_task2_percent": 0.027599911680282623,
+      "top1_pred_task3_percent": 93.42386104364466,
+      "top1_pred_checkpoint_stage_percent": 93.42386104364466
+    },
+    {
+      "checkpoint": "task3",
+      "eval_split": "task1",
+      "samples": 3052,
+      "candidates": 13035,
+      "Recall@1": 1.0157273918741807,
+      "Recall@3": 2.8505897771952817,
+      "Recall@5": 4.193971166448231,
+      "NDCG@1": 1.0157273918741807,
+      "NDCG@3": 2.0404077451163474,
+      "NDCG@5": 2.5916884681344188,
+      "MRR": 3.3276146080047084,
+      "top1_pred_base_percent": 3.4076015727391877,
+      "top1_pred_task1_percent": 1.0484927916120577,
+      "top1_pred_task2_percent": 0.0,
+      "top1_pred_task3_percent": 95.54390563564876,
+      "top1_pred_checkpoint_stage_percent": 95.54390563564876
+    },
+    {
+      "checkpoint": "task3",
+      "eval_split": "task2",
+      "samples": 3206,
+      "candidates": 13035,
+      "Recall@1": 0.09357454772301933,
+      "Recall@3": 0.3431066749844042,
+      "Recall@5": 0.8421709295071741,
+      "NDCG@1": 0.09357454772301933,
+      "NDCG@3": 0.23059230518579035,
+      "NDCG@5": 0.43322522232700567,
+      "MRR": 1.1216166833007775,
+      "top1_pred_base_percent": 5.053025577043044,
+      "top1_pred_task1_percent": 0.12476606363069245,
+      "top1_pred_task2_percent": 0.09357454772301933,
+      "top1_pred_task3_percent": 94.72863381160325,
+      "top1_pred_checkpoint_stage_percent": 94.72863381160325
+    },
+    {
+      "checkpoint": "task3",
+      "eval_split": "task3",
+      "samples": 3056,
+      "candidates": 13035,
+      "Recall@1": 28.206806282722514,
+      "Recall@3": 45.32068062827225,
+      "Recall@5": 52.617801047120416,
+      "NDCG@1": 28.206806282722514,
+      "NDCG@3": 38.19043236877281,
+      "NDCG@5": 41.2055028046613,
+      "MRR": 39.718190038391434,
+      "top1_pred_base_percent": 2.6832460732984296,
+      "top1_pred_task1_percent": 0.06544502617801047,
+      "top1_pred_task2_percent": 0.032722513089005235,
+      "top1_pred_task3_percent": 97.21858638743456,
+      "top1_pred_checkpoint_stage_percent": 97.21858638743456
+    }
+  ]
+}

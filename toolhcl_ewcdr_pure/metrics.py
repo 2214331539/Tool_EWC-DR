@@ -4,8 +4,13 @@ from typing import Any, Iterable
 
 import torch
 
+from .utils import EXPECTED_TOOL_COUNTS, STAGES
+
 
 METRIC_NAMES = ("Recall@1", "Recall@3", "Recall@5", "NDCG@1", "NDCG@3", "NDCG@5", "MRR")
+PREDICTION_STAGE_METRIC_NAMES = tuple(f"top1_pred_{stage}_percent" for stage in STAGES) + (
+    "top1_pred_checkpoint_stage_percent",
+)
 
 
 class RetrievalMetrics:
@@ -48,4 +53,28 @@ class RetrievalMetrics:
         for value in self.topk:
             result[f"NDCG@{value}"] = self.ndcg[value] / denominator * 100.0
         result["MRR"] = self.mrr / denominator * 100.0
+        return result
+
+
+class PredictionStageMetrics:
+    def __init__(self) -> None:
+        self.samples = 0
+        self.counts = {stage: 0 for stage in STAGES}
+
+    def update(self, logits: torch.Tensor, candidate_count: int) -> None:
+        predictions = logits.detach()[:, :candidate_count].argmax(dim=1)
+        self.samples += int(predictions.numel())
+        lower = 0
+        for stage in STAGES:
+            upper = EXPECTED_TOOL_COUNTS[stage]
+            self.counts[stage] += int(((predictions >= lower) & (predictions < upper)).sum().item())
+            lower = upper
+
+    def result(self, checkpoint_stage: str) -> dict[str, float]:
+        denominator = max(1, self.samples)
+        result = {
+            f"top1_pred_{stage}_percent": self.counts[stage] / denominator * 100.0
+            for stage in STAGES
+        }
+        result["top1_pred_checkpoint_stage_percent"] = result[f"top1_pred_{checkpoint_stage}_percent"]
         return result

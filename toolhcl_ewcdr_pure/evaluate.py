@@ -13,7 +13,7 @@ from tqdm import tqdm
 from .cache import build_feature_cache, cache_is_valid, load_feature_dataset
 from .data import build_global_eval_samples, load_stage_tools, make_loader
 from .ewcdr import load_importance
-from .metrics import METRIC_NAMES, RetrievalMetrics
+from .metrics import METRIC_NAMES, PREDICTION_STAGE_METRIC_NAMES, PredictionStageMetrics, RetrievalMetrics
 from .model import build_retriever, load_checkpoint, load_frozen_encoder
 from .utils import (
     EXPECTED_TOOL_COUNTS,
@@ -60,7 +60,14 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    fields = ["checkpoint", "eval_split", "samples", "candidates", *METRIC_NAMES]
+    fields = [
+        "checkpoint",
+        "eval_split",
+        "samples",
+        "candidates",
+        *METRIC_NAMES,
+        *PREDICTION_STAGE_METRIC_NAMES,
+    ]
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -122,12 +129,15 @@ def evaluate_checkpoint(
     candidate_count = EXPECTED_TOOL_COUNTS[checkpoint_stage]
     accumulators = {"global": RetrievalMetrics(topk)}
     accumulators.update({stage: RetrievalMetrics(topk) for stage in STAGES})
+    prediction_accumulators = {"global": PredictionStageMetrics()}
+    prediction_accumulators.update({stage: PredictionStageMetrics() for stage in STAGES})
     model.eval()
     for batch in tqdm(loader, desc=f"pure eval {checkpoint_stage}", dynamic_ncols=True, mininterval=2.0):
         with autocast_context(device, amp_enabled, amp_dtype):
             logits = model.forward_batch(batch, device)
         targets = batch["tool_id"].to(device, non_blocking=True)
         accumulators["global"].update(logits, targets, candidate_count)
+        prediction_accumulators["global"].update(logits, candidate_count)
         for source_stage in STAGES:
             indices = [index for index, value in enumerate(batch["source_stage"]) if value == source_stage]
             if indices:
@@ -135,7 +145,16 @@ def evaluate_checkpoint(
                 accumulators[source_stage].update(
                     logits.index_select(0, index_tensor), targets.index_select(0, index_tensor), candidate_count
                 )
-    return {name: accumulator.result() for name, accumulator in accumulators.items()}
+                prediction_accumulators[source_stage].update(
+                    logits.index_select(0, index_tensor), candidate_count
+                )
+    return {
+        name: {
+            **accumulator.result(),
+            **prediction_accumulators[name].result(checkpoint_stage),
+        }
+        for name, accumulator in accumulators.items()
+    }
 
 
 def _importance_rows(output_dir: Path) -> list[dict[str, Any]]:
@@ -159,20 +178,31 @@ def _write_summary(
 ) -> None:
     training_path = output_dir / "training_summary.json"
     training = json.load(open(training_path, encoding="utf-8")) if training_path.exists() else {}
+    classification_scope = str(
+        training.get("classification_scope", config.get("training", {}).get("classification_scope", "all_visible"))
+    )
+    lambda_ewc = float(config.get("ewcdr", {}).get("lambda", 0.0))
+    if classification_scope != "all_visible":
+        raise ValueError(f"V2 requires classification_scope=all_visible, got {classification_scope}")
+    scope_description = (
+        "Incremental CE uses every currently visible classifier row, so train-time logits and "
+        "task-agnostic inference candidates share the same global tool space."
+    )
+    deviation_description = (
+        "Incremental CE covers all visible tools instead of the original new-class slice. This is "
+        "an explicit ToolHCL retrieval adaptation."
+    )
     importance_rows = _importance_rows(output_dir)
+    importance_limit = config.get("ewcdr", {}).get("importance_max_samples")
+    if importance_limit is None:
+        importance_description = "the complete available stage-train partition"
+    else:
+        importance_description = f"a fixed tool-ID coverage subset of at most {int(importance_limit):,} samples"
+    selection_protocol = config.get("selection_protocol", {})
     final = next((row for row in global_rows if row["checkpoint"] == "task3"), None)
     matrix_index = {(row["checkpoint"], row["eval_split"]): row for row in matrix_rows}
     parse_audit_path = resolve_path(config["cache"]["root"], project_root(config)) / "parse_audit.json"
     parse_audit = json.load(open(parse_audit_path, encoding="utf-8")) if parse_audit_path.exists() else {}
-    archived_final = None
-    archived_dir = config.get("report", {}).get("archived_comparison_dir")
-    if archived_dir:
-        archived_csv = resolve_path(archived_dir, project_root(config)) / "global_eval.csv"
-        if archived_csv.exists():
-            with open(archived_csv, encoding="utf-8", newline="") as handle:
-                archived_final = next(
-                    (row for row in csv.DictReader(handle) if row.get("checkpoint") == "task3"), None
-                )
     lines = [
         "# Pure ToolHCL EWC-DR Baseline",
         "",
@@ -188,7 +218,7 @@ def _write_summary(
         "",
         "Frozen encoder hidden states are cached after the complete LLaMA forward. Reusing deterministic frozen features across epochs is mathematically equivalent to rerunning the unchanged encoder and changes runtime only.",
         "",
-        "Normal training uses cross entropy on original logits. Logit negation is used only while estimating importance after a stage; it is never used for optimizer updates or evaluation.",
+        f"Normal training uses cross entropy on original logits with classification scope `{classification_scope}`. {scope_description} Logit negation is used only while estimating importance after a stage; it is never used for optimizer updates or evaluation.",
         "",
         "## Continual Protocol",
         "",
@@ -196,11 +226,24 @@ def _write_summary(
         "",
         "## Original-Code Deviations",
         "",
-        "The official image implementation trains ResNet-18 with SGD, computes importance on the full task train set, clips importance at 1e-4, blends old/current importance by a class-ratio alpha, and trains incremental CE over the new-class slice. This retrieval transfer instead uses frozen LLaMA plus a projection/classifier, a fixed 10,000-sample tool-ID coverage subset, configured optional 1e-4 clipping, gamma=1 online accumulation, and CE over all currently visible tools as required by the ToolHCL retrieval protocol.",
-        "",
-        "## Training",
+        f"The official image implementation trains ResNet-18 with SGD, computes importance on the full task train set, clips importance at 1e-4, blends old/current importance by a class-ratio alpha, and trains incremental CE over the new-class slice. This retrieval transfer uses frozen LLaMA plus a projection/classifier, {importance_description}, configured optional 1e-4 clipping, and gamma=1 online accumulation. {deviation_description}",
         "",
     ]
+    if selection_protocol:
+        selected_epochs = selection_protocol.get("selected_epochs", {})
+        lines.extend([
+            "## Epoch Selection Protocol",
+            "",
+            "A fixed-seed, tool-ID-stratified 10% validation partition is derived from each training split. The selection pass trains on the remaining 90% and chooses each stage epoch by the harmonic mean of historical-task mean Recall@1 and current-task Recall@1 over all visible candidates. No test split is used for epoch selection.",
+            "",
+            "After selection, the model is restarted from scratch and every stage is retrained on 100% of its original training split for the selected number of epochs. Final metrics use the unchanged complete test splits and candidate sets.",
+            "",
+            "Selected epochs: " + ", ".join(
+                f"{stage}={selected_epochs.get(stage, 'missing')}" for stage in STAGES
+            ) + ".",
+            "",
+        ])
+    lines.extend(["## Training", ""])
     if training.get("stages"):
         lines.extend([
             "| stage | epochs | final CE | final EWC | final total | avg epoch sec | train sec | importance sec | stop reason |",
@@ -268,6 +311,20 @@ def _write_summary(
             "",
         ])
     lines.extend(["## Global Eval", "", _markdown_table(global_rows), "", "## Seen Task Matrix", "", _markdown_table(matrix_rows), ""])
+    if matrix_rows and "top1_pred_base_percent" in matrix_rows[0]:
+        lines.extend([
+            "## Top-1 Prediction Stage Distribution",
+            "",
+            "| checkpoint | eval split | base | task1 | task2 | task3 |",
+            "| --- | --- | ---: | ---: | ---: | ---: |",
+        ])
+        for row in matrix_rows:
+            lines.append(
+                f"| {row['checkpoint']} | {row['eval_split']} | "
+                f"{row['top1_pred_base_percent']:.4f} | {row['top1_pred_task1_percent']:.4f} | "
+                f"{row['top1_pred_task2_percent']:.4f} | {row['top1_pred_task3_percent']:.4f} |"
+            )
+        lines.append("")
     lines.extend([
         "## Interpretation",
         "",
@@ -301,22 +358,16 @@ def _write_summary(
             "7. **New-row regularization.** New classifier rows are outside the common old/new tensor prefix and therefore receive no historical EWC penalty until their own stage importance is accumulated.",
             "8. **Projection importance.** Every query-projection tensor has at least one nonzero importance element in base/task1/task2; the run would abort if an entire trainable tensor were zero.",
             f"9. **EWC is active.** Final-stage EWC losses are task1={final_losses['task1']['ewc_loss']:.6f}, task2={final_losses['task2']['ewc_loss']:.6f}, and task3={final_losses['task3']['ewc_loss']:.6f}; they are not numerical zeros.",
-            "10. **Epochs.** " + ", ".join(f"{stage}={stage_index[stage]['completed_epochs']}" for stage in STAGES) + ". All stages stopped because the configured 30-epoch maximum was reached while loss continued to improve.",
-            f"11. **Current-task learning.** Diagonal Recall@1 is base={base_initial.get('Recall@1', 0):.4f}, task1={task1_initial.get('Recall@1', 0):.4f}, task2={task2_initial.get('Recall@1', 0):.4f}, and task3={matrix_index[('task3', 'task3')]['Recall@1']:.4f}; each stage learns its current tools strongly.",
+            "10. **Epochs.** " + ", ".join(
+                f"{stage}={stage_index[stage]['completed_epochs']} ({stage_index[stage]['stop_reason']})"
+                for stage in STAGES
+            ) + ".",
+            f"11. **Current-task learning.** Diagonal Recall@1 is base={base_initial.get('Recall@1', 0):.4f}, task1={task1_initial.get('Recall@1', 0):.4f}, task2={task2_initial.get('Recall@1', 0):.4f}, and task3={matrix_index[('task3', 'task3')]['Recall@1']:.4f}. These values must be interpreted together with the prediction-stage distribution.",
             f"12. **Forgetting.** By task3, base Recall@1 changes {base_initial.get('Recall@1', 0):.4f}->{base_final.get('Recall@1', 0):.4f}, task1 {task1_initial.get('Recall@1', 0):.4f}->{task1_final.get('Recall@1', 0):.4f}, and task2 {task2_initial.get('Recall@1', 0):.4f}->{task2_final.get('Recall@1', 0):.4f}. Forgetting remains severe despite a measurable EWC penalty.",
-            "13. **Expected behavior.** Strong current-task accuracy together with substantial old-task loss is plausible for diagonal online EWC without replay in a 13k-class, highly imbalanced class-incremental problem. It is an empirical result, not evidence that lambda=1000 is universally optimal.",
+            f"13. **Expected behavior.** Strong current-task accuracy together with substantial old-task loss is plausible for diagonal online EWC without replay in a 13k-class, highly imbalanced class-incremental problem. It is an empirical result, not evidence that lambda={lambda_ewc:g} is universally optimal.",
         ])
-        if archived_final:
-            old_r1 = float(archived_final["Recall@1"])
-            old_mrr = float(archived_final["MRR"])
-            lines.append(
-                f"14. **Difference from archived ToolHCL+EWC-DR.** Archived task3 global R@1/MRR were {old_r1:.4f}/{old_mrr:.4f}; pure values are {final['Recall@1']:.4f}/{final['MRR']:.4f}. "
-                "The difference cannot be attributed to EWC-DR alone: the archived run included hierarchy routers, boxes, prompts, auxiliary losses, a different trainable path, and a slightly different parsed evaluation count."
-            )
-        else:
-            lines.append("14. **Difference from archived ToolHCL+EWC-DR.** No archived metrics path was configured; architecture-level differences are documented above and must not be interpreted as an EWC-only ablation.")
         lines.append(
-            "15. **Baseline suitability.** The implementation is method-clean enough to serve as an independent EWC-DR baseline. Publication-level comparison still requires the same pure architecture/hyperparameter protocol for sequential fine-tuning and vanilla EWC, multiple seeds, and disclosure of the 10,000-sample importance approximation and parser exclusions."
+            f"14. **Baseline suitability.** The implementation is method-clean enough to serve as an independent EWC-DR baseline. Publication-level comparison still requires the same architecture/hyperparameter protocol for sequential fine-tuning and vanilla EWC, multiple seeds, and disclosure that importance uses {importance_description} plus the recorded parser exclusions."
         )
     (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

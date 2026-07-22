@@ -14,11 +14,14 @@ data/
 models_hf/
 toolhcl_links/
 toolhcl_ewcdr_data/
+toolhcl_ewcdr_cache*
 toolhcl_ewcdr_pure_cache*
 artifacts/
 
 # Generated experiment artifacts.
 toolhcl_ewcdr_runs*
+/toolhcl_ewcdr_v2*/
+/toolhcl_seqft_*/
 checkpoints/
 logs/
 wandb/
@@ -27,18 +30,3 @@ wandb/
 *.pth
 *.ckpt
 *.safetensors
-
-# Archived migration prototype; the published baseline is toolhcl_ewcdr_pure.
-toolhcl_ewcdr/
-configs/toolhcl_ewcdr.yaml
-configs/toolhcl_ewcdr_converged.yaml
-configs/toolhcl_ewcdr_fast.yaml
-scripts/run_toolhcl_ewcdr.sh
-scripts/eval_toolhcl_ewcdr.sh
-scripts/smoke_test_toolhcl_ewcdr.sh
-scripts/run_toolhcl_ewcdr_converged.sh
-scripts/eval_toolhcl_ewcdr_converged.sh
-scripts/smoke_test_toolhcl_ewcdr_converged.sh
-scripts/run_toolhcl_ewcdr_fast.sh
-scripts/eval_toolhcl_ewcdr_fast.sh
-scripts/smoke_test_toolhcl_ewcdr_fast.sh
