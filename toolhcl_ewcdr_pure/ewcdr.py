@@ -35,6 +35,8 @@ def compute_importance(
     accumulation_device: str | torch.device = "cpu",
     omega_max: float | None = None,
     verify_unchanged: bool = False,
+    first_class: int = 0,
+    model_mode: str = "eval",
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     if method not in {"ewc", "ewc_dr"}:
         raise ValueError(f"Unsupported importance method: {method}")
@@ -47,8 +49,16 @@ def compute_importance(
         for name, parameter in parameters.items()
     }
     before = parameter_snapshot(model) if verify_unchanged else None
+    active_first_class = int(first_class)
+    if active_first_class < 0 or active_first_class >= int(model.num_tools):
+        raise ValueError(
+            f"Invalid importance first_class={active_first_class} for {model.num_tools} logits"
+        )
+    importance_model_mode = str(model_mode).lower()
+    if importance_model_mode not in {"train", "eval"}:
+        raise ValueError(f"Unsupported importance model_mode={model_mode}")
     was_training = model.training
-    model.eval()
+    model.train(importance_model_mode == "train")
     batches = 0
     samples = 0
     for batch_index, batch in enumerate(dataloader):
@@ -57,9 +67,18 @@ def compute_importance(
         model.zero_grad(set_to_none=True)
         with autocast_context(device, amp_enabled, amp_dtype):
             logits = model.forward_batch(batch, device)
+        targets = batch["tool_id"].to(device, non_blocking=True)
+        if bool(torch.any(targets < active_first_class)) or bool(
+            torch.any(targets >= logits.shape[1])
+        ):
+            raise ValueError(
+                "Importance targets must lie in "
+                f"[{active_first_class}, {logits.shape[1]})"
+            )
+        logits = logits[:, active_first_class:]
+        targets = targets - active_first_class
         if method == "ewc_dr":
             logits = -logits
-        targets = batch["tool_id"].to(device, non_blocking=True)
         loss = F.cross_entropy(logits.float(), targets).float()
         loss.backward()
         for name, parameter in parameters.items():
@@ -74,15 +93,21 @@ def compute_importance(
             value.clamp_(max=float(omega_max))
         importance[name] = value.cpu().float()
     model.zero_grad(set_to_none=True)
-    if was_training:
-        model.train()
+    model.train(was_training)
     if before is not None:
         _assert_parameters_equal(before, model)
     summary = importance_summary(importance)
     if any(row["nonzero"] == 0 for row in summary):
         zero_names = [row["name"] for row in summary if row["nonzero"] == 0]
         raise RuntimeError(f"Importance is entirely zero for trainable parameters: {zero_names}")
-    return importance, {"batches": batches, "samples": samples, "parameters": summary}
+    return importance, {
+        "batches": batches,
+        "samples": samples,
+        "first_class": active_first_class,
+        "classification_candidates": int(model.num_tools) - active_first_class,
+        "model_mode": importance_model_mode,
+        "parameters": summary,
+    }
 
 
 def accumulate_online(
@@ -99,6 +124,27 @@ def accumulate_online(
         common = common_prefix_slices(total[name].shape, old_value.shape)
         if common is not None:
             total[name][common].add_(old_value[common].float(), alpha=float(gamma))
+    return total
+
+
+def accumulate_class_ratio(
+    previous: Mapping[str, torch.Tensor] | None,
+    current: Mapping[str, torch.Tensor],
+    alpha: float,
+) -> dict[str, torch.Tensor]:
+    """Blend the historical prefix exactly as the official EWC-DR implementation."""
+    blend = float(alpha)
+    if blend < 0.0 or blend > 1.0:
+        raise ValueError(f"alpha must lie in [0, 1], got {alpha}")
+    total = {name: value.detach().cpu().float().clone() for name, value in current.items()}
+    if not previous:
+        return total
+    for name, old_value in previous.items():
+        if name not in total:
+            continue
+        common = common_prefix_slices(total[name].shape, old_value.shape)
+        if common is not None:
+            total[name][common].mul_(1.0 - blend).add_(old_value[common].float(), alpha=blend)
     return total
 
 

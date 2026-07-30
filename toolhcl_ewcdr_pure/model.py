@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import nn
 
-from .utils import EXPECTED_OLD_TOOL_COUNTS, EXPECTED_TOOL_COUNTS
+from .utils import protocol_old_tool_counts, protocol_tool_counts
 
 
 class FrozenLlamaEncoder(nn.Module):
@@ -119,11 +119,12 @@ def load_frozen_encoder(config: Mapping[str, Any], device: torch.device) -> Froz
 def build_retriever(
     config: Mapping[str, Any], stage: str, *, encoder: FrozenLlamaEncoder | None = None
 ) -> PureEwcDrRetriever:
-    if stage not in EXPECTED_TOOL_COUNTS:
+    tool_counts = protocol_tool_counts(config)
+    if stage not in tool_counts:
         raise ValueError(f"Unknown stage: {stage}")
     model_config = config["model"]
     model = PureEwcDrRetriever(
-        num_tools=EXPECTED_TOOL_COUNTS[stage],
+        num_tools=tool_counts[stage],
         encoder=encoder,
         hidden_size=int(model_config.get("hidden_size", 4096)),
         projection_hidden=int(model_config.get("projection_hidden", 1024)),
@@ -145,15 +146,22 @@ def trainable_summary(model: nn.Module) -> dict[str, Any]:
 
 
 def initialize_from_previous(
-    model: PureEwcDrRetriever, checkpoint_path: str | Path, stage: str, *, verify_exact: bool = True
+    model: PureEwcDrRetriever,
+    checkpoint_path: str | Path,
+    stage: str,
+    *,
+    config: Mapping[str, Any],
+    verify_exact: bool = True,
 ) -> dict[str, Any]:
-    if stage not in EXPECTED_OLD_TOOL_COUNTS:
+    old_tool_counts = protocol_old_tool_counts(config)
+    tool_counts = protocol_tool_counts(config)
+    if stage not in old_tool_counts:
         raise ValueError(f"No previous-stage expansion is defined for {stage}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     old_count = int(checkpoint["num_tools"])
-    expected_old = EXPECTED_OLD_TOOL_COUNTS[stage]
+    expected_old = old_tool_counts[stage]
     assert old_count == expected_old, f"{stage} old_num_tools={old_count}, expected {expected_old}"
-    assert model.num_tools == EXPECTED_TOOL_COUNTS[stage]
+    assert model.num_tools == tool_counts[stage]
     model.query_projection.load_state_dict(checkpoint["query_projection"], strict=True)
     old_weight = checkpoint["classifier"]["weight"]
     old_bias = checkpoint["classifier"]["bias"]

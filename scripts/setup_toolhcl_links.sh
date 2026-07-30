@@ -30,6 +30,10 @@ if [[ -n "${TOOLHCL_ROOT:-}" ]]; then
   link_asset "${TOOLHCL_ROOT}" "${ROOT}/toolhcl_links/ToolHCHL"
 fi
 
+if [[ -n "${TRANSACTION_DATA_ROOT:-}" ]]; then
+  link_asset "${TRANSACTION_DATA_ROOT}" "${ROOT}/toolhcl_links/transaction"
+fi
+
 model_dir="${ROOT}/toolhcl_links/models/Meta-Llama-3-8B"
 if [[ ! -f "${model_dir}/config.json" || ! -f "${model_dir}/tokenizer.json" ]]; then
   echo "Expected a complete Meta-Llama-3-8B checkout under ${model_dir}" >&2
@@ -54,5 +58,29 @@ for required in \
     exit 1
   fi
 done
+
+if [[ -n "${TRANSACTION_DATA_ROOT:-}" ]]; then
+  for required in \
+    base/raw/retrieval_train.json \
+    base/raw/retrieval_eval.json \
+    base/raw/train_tools_with_id.json \
+    task1/raw/retrieval_train.json \
+    task1/raw/retrieval_eval.json \
+    task1/raw/toolret_task1_tools_with_id.json \
+    task2/raw/retrieval_train.json \
+    task2/raw/retrieval_eval.json \
+    task2/raw/toolret_task2_tools_with_id.json \
+    task3/raw/retrieval_train.json \
+    task3/raw/retrieval_eval.json \
+    task3/raw/toolret_task3_tools_with_id.json \
+    task4/raw/retrieval_train.json \
+    task4/raw/retrieval_eval.json \
+    task4/raw/toolret_task4_tools_with_id.json; do
+    if [[ ! -f "${ROOT}/toolhcl_links/transaction/${required}" ]]; then
+      echo "Missing Transaction input: ${required}" >&2
+      exit 1
+    fi
+  done
+fi
 
 echo "ToolHCL data and model links are ready."

@@ -1,54 +1,43 @@
-# Tool EWC-DR V2
+# Tool EWC-DR: ToolRet V6
 
-本仓库只保留 **V2 validated full-importance**：EWC-DR 在 ToolHCL 持续工具检索任务上的单一、可复现迁移实现。流程为 `base -> task1 -> task2 -> task3`，使用训练集内验证选择轮次，再从头使用完整训练集重训，最后才读取正式测试集。
-
-本实现不修改或 import ToolHCL 的训练代码，不包含 ToolHCL 的 router、prompt pool、层级 box、geo loss、contrastive loss、replay 或 distillation。它只复用 ToolHCL 数据协议和 Meta-Llama-3-8B 模型资产。
-
-## 来源与外部资产
-
-- EWC-DR 论文：[Elastic Weight Consolidation Done Right for Continual Learning](https://arxiv.org/abs/2603.18596)
-- EWC-DR 上游代码：[scarlet0703/EWC-DR](https://github.com/scarlet0703/EWC-DR)
-- ToolHCL 项目：[2214331539/ToolHCHL](https://github.com/2214331539/ToolHCHL)
-- ToolHCL base 数据来源：[OpenBMB/ToolBench](https://github.com/OpenBMB/ToolBench)
-- 冻结查询编码器：[meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B)
-
-数据和模型受各自许可证约束，不提交到本仓库。使用者需要从 ToolHCL 项目准备 base/task1/task2/task3 数据，并自行获得 Meta-Llama-3-8B 权限和完整本地权重。
-
-## V2 模型与数据流
+`toolret` 分支提供 EWC-DR 在 ToolRet Transaction 持续工具检索数据集上的 V6 迁移实现。协议为：
 
 ```text
-query text
-  -> LLaMA tokenizer (right padding, max_length=512)
-  -> 完整 32 层冻结 Meta-Llama-3-8B
-  -> 最后一个有效 token 的 4096 维 hidden state
-  -> trainable projection: 4096 -> 1024 -> 384
-  -> 累积扩展的 global linear classifier
-  -> 所有当前可见 tool logits
-  -> 全局 tool ID 排名
+base -> task1 -> task2 -> task3 -> task4
 ```
 
-LLaMA 的最终 hidden state 按样本缓存为 CPU BF16 分片。由于 encoder 完全冻结且处于 eval 模式，复用缓存与每轮重复执行同一个冻结 LLaMA forward 在当前模型边界下等价；projection 和 classifier 始终实时训练。
+本实现不修改或 import ToolHCL 的训练模块。模型只包含完整冻结的 Meta-Llama-3-8B、可训练 query projection、累计扩展的 global classifier，以及 EWC-DR reversed-logits importance 和参数正则。
 
-四阶段候选工具数量固定为：
+## 方法边界
 
-| stage | visible tools | new tools |
-| --- | ---: | ---: |
-| base | 11,112 | 11,112 |
-| task1 | 11,752 | 640 |
-| task2 | 12,392 | 640 |
-| task3 | 13,035 | 643 |
+原始 EWC-DR 图像代码在增量阶段只对新增类别 slice 计算 CE。直接迁移到 ToolRet 的全局工具检索会出现两个极端：
 
-增量阶段会逐行精确复制历史 classifier 和完整 projection，只初始化新增 classifier 行。每个阶段只使用该阶段 train split，不回放历史 query。
+- `current-stage CE` 不直接压低旧工具，但没有学习跨阶段 logit 校准；
+- `all-visible CE` 将每个旧工具持续作为负类，造成严重遗忘。
 
-## V2 EWC-DR 目标
-
-正常训练在所有当前可见工具上使用原始 logits：
+V6 使用 current-stage CE 为主，并加入由工具数量确定的弱 global calibration CE：
 
 ```text
-L_task = CE(logits_all_visible, global_tool_id)
+beta_t = new_tools_t / visible_tools_t
+L_task = (1 - beta_t) * CE(current_stage_logits, target)
+       + beta_t * CE(all_visible_logits, target)
+L = L_task + lambda/2 * sum_i Omega_i * (theta_i - theta_i_old)^2
 ```
 
-阶段结束后，只在 importance 计算中反转 logits：
+base 阶段使用完整 base CE。Transaction 各增量阶段的 `beta_t` 固定为：
+
+| stage | old tools | new tools | visible tools | beta |
+| --- | ---: | ---: | ---: | ---: |
+| task1 | 14,175 | 2,382 | 16,557 | 0.143867 |
+| task2 | 16,557 | 2,373 | 18,930 | 0.125357 |
+| task3 | 18,930 | 2,361 | 21,291 | 0.110892 |
+| task4 | 21,291 | 2,348 | 23,639 | 0.099327 |
+
+这些权重只由协议中的工具数量确定，不读取 eval/test 指标。V6 是面向 ToolRet 全局检索协议的 calibrated EWC-DR adaptation；严格论文版 current-stage CE 应作为独立 baseline 报告。
+
+## EWC-DR
+
+正常训练和评估始终使用原始 logits。阶段训练结束后，仅在 importance 计算中执行：
 
 ```text
 reversed_logits = -logits
@@ -56,116 +45,132 @@ L_importance = CE(reversed_logits, global_tool_id)
 Omega_i = mean((dL_importance / dtheta_i)^2)
 ```
 
-后续阶段训练目标：
+V6 使用：
+
+- `lambda=10000`；
+- 完整阶段训练集估计 importance；
+- `omega_max=1e-4`；
+- EWC-DR 官方 class-count alpha 累积；
+- importance 模型处于 train mode；
+- CPU FP32 importance 和参数 snapshot；
+- task4 后不计算无后续用途的 final importance。
+
+EWC 只保护 `requires_grad=True` 的 query projection 和历史 classifier 公共前缀。冻结 LLaMA 不参与 EWC；新增 classifier 行在首次引入时没有历史 importance。
+
+## 模型数据流
 
 ```text
-L = L_task + lambda/2 * sum_i Omega_i * (theta_i - theta_old_i)^2
+query text
+  -> LLaMA tokenizer (right padding, max_length=512)
+  -> 完整 32 层冻结 Meta-Llama-3-8B
+  -> 最后一个有效 token 的 4096 维 hidden state
+  -> query projection: 4096 -> 1024 -> 384
+  -> cumulative global linear classifier
+  -> 当前 checkpoint 的全部可见工具 logits
+  -> 按原始 logits 降序检索 global tool ID
 ```
 
-V2 固定 `lambda=10000`、`gamma=1`、`omega_max=1e-4`。base、task1、task2 importance 使用各阶段完整训练分区；task3 后没有后续任务，因此不再计算 task3 importance。importance 和参数快照保存为 CPU FP32。
+冻结 LLaMA 的最终 hidden state 按样本缓存为 CPU BF16 分片。projection 和 classifier 每轮实时训练。缓存只避免重复执行完全相同的冻结 encoder forward，不改变算法输出。
 
-EWC 只保护 `requires_grad=True` 的参数：
+## 外部资产
 
-- `query_projection.layers.{0,3,4}.{weight,bias}`
-- 历史 classifier `weight` 和 `bias` 的公共前缀
+- EWC-DR 论文：[Elastic Weight Consolidation Done Right for Continual Learning](https://arxiv.org/abs/2603.18596)
+- EWC-DR 上游代码：[scarlet0703/EWC-DR](https://github.com/scarlet0703/EWC-DR)
+- ToolHCL 项目：[2214331539/ToolHCHL](https://github.com/2214331539/ToolHCHL)
+- ToolHCL base 数据来源：[OpenBMB/ToolBench](https://github.com/OpenBMB/ToolBench)
+- 冻结 encoder：[meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B)
 
-冻结 LLaMA 不参与 importance 或 EWC。新增 classifier 行在被首次引入时没有历史 importance，因此当前阶段不受历史 EWC 惩罚。
-
-与原始图像 EWC-DR 的主要差异是：V2 使用冻结 LLaMA、AdamW 和全局可见工具 CE；原图像实现使用可训练 ResNet、SGD 和新增类别 slice CE。核心 reversed-logits importance、参数快照和二次正则保持不变。因此应称为 **EWC-DR adapted to ToolHCL continual retrieval**，不是图像代码的逐行复现。
+数据和模型受各自许可证约束，不提交到本仓库。使用者需要自行获得 Meta-Llama-3-8B 权限和 ToolRet Transaction 数据。
 
 ## 数据协议
 
-期望的数据目录：
+Transaction 根目录需要包含：
 
 ```text
-TOOLHCL_DATA_ROOT/
-├── train/raw/{retrieval_train.json,retrieval_eval.json,train_tools_with_id.json}
-├── task1/raw/{retrieval_train.json,retrieval_eval.json,task1_tools_with_id.json}
-├── task2/raw/{retrieval_train.json,retrieval_eval.json,task2_tools_with_id.json}
-└── task3/raw/{retrieval_train.json,retrieval_eval.json,task3_tools_with_id.json}
+Transaction/
+├── base/raw/{retrieval_train.json,retrieval_eval.json,train_tools_with_id.json}
+├── task1/raw/{retrieval_train.json,retrieval_eval.json,toolret_task1_tools_with_id.json}
+├── task2/raw/{retrieval_train.json,retrieval_eval.json,toolret_task2_tools_with_id.json}
+├── task3/raw/{retrieval_train.json,retrieval_eval.json,toolret_task3_tools_with_id.json}
+└── task4/raw/{retrieval_train.json,retrieval_eval.json,toolret_task4_tools_with_id.json}
 ```
 
-样本从 `conversations` 中读取 `role=user` 的 `content` 作为 query，并从 `role=assistant` 的 `<<tool_name&&api_name>>` 前缀解析 gold tool。工具文件提供连续稳定的 global `tool_id`。正式 global eval 是四个完整 eval split 的并集；候选集是 checkpoint 阶段全部可见工具，不做负采样或候选裁剪。
+配置从 `target_tool_id` 读取连续 global label。训练前汇总全部五个原始 eval split 的 `source_id` 和规范化 query；原始 eval 全部保留，从 train 中移除命中任一 eval key 的记录。源 JSON 和候选工具字典不被修改。
 
-V2 的解析样本数：base/task1/task2/task3 train 为 `232982/13157/13932/12989`，eval 为 `54348/3052/3206/3056`，global eval 共 `63662` 条。
+V6 实际样本数：
 
-## Epoch 选择协议
+| stage | clean train | complete eval | cumulative candidates |
+| --- | ---: | ---: | ---: |
+| base | 174,613 | 39,771 | 14,175 |
+| task1 | 30,432 | 6,978 | 16,557 |
+| task2 | 29,162 | 6,643 | 18,930 |
+| task3 | 31,233 | 7,102 | 21,291 |
+| task4 | 30,205 | 6,844 | 23,639 |
 
-1. 对每个 stage train split 按 tool ID、seed 42 固定划分约 90% train 和 10% validation；单样本 tool 只留在 train。
-2. selection pass 最多训练 30 epochs。base 按自身 validation Recall@1 选轮次；增量阶段按“历史任务平均 Recall@1”和“当前任务 Recall@1”的调和均值选轮次。
-3. selection 不构建或读取正式 eval/global eval 缓存。
-4. 得到轮次后重新随机初始化模型，在 100% 原始 train split 上从头训练。
-5. 全量重训结束后才运行完整 seen-task matrix 和 global eval。
+global eval 是五个完整 eval split 的并集，共 67,338 条，不裁剪候选集。
 
-seed 42 的已验证选择结果是 `base=7, task1=2, task2=1, task3=2`。
+## 安装
 
-## 安装和资产链接
-
-推荐 Linux、Python 3.10+、CUDA PyTorch 2.1+。首次 LLaMA 特征缓存建议单卡至少约 26 GiB 空闲显存。
+推荐 Linux、Python 3.10+ 和 CUDA PyTorch。首次构建 LLaMA 特征缓存建议单卡至少 30 GiB 空闲显存。
 
 ```bash
-git clone git@github.com:2214331539/Tool_EWC-DR.git
+git clone --branch toolret git@github.com:2214331539/Tool_EWC-DR.git
 cd Tool_EWC-DR
 python -m venv .venv
 source .venv/bin/activate
-# 按本机 CUDA 版本安装 PyTorch，然后：
+# 按本机 CUDA 安装 PyTorch，然后：
 pip install -r requirements_toolhcl.txt
 ```
 
-模型目录应包含 `Meta-Llama-3-8B/config.json`、tokenizer 和全部 safetensors。创建只读资产软链接：
+创建只读数据和模型软链接：
 
 ```bash
-TOOLHCL_DATA_ROOT=/path/to/ToolHCL/data \
+TOOLHCL_DATA_ROOT=/path/to/original/toolhcl_data \
 TOOLHCL_MODELS_ROOT=/path/to/models_hf \
-TOOLHCL_ROOT=/path/to/ToolHCHL \
+TRANSACTION_DATA_ROOT=/path/to/Transaction \
 bash scripts/setup_toolhcl_links.sh
 ```
 
-脚本创建 `toolhcl_links/data`、`toolhcl_links/models` 和可选的 `toolhcl_links/ToolHCHL`。这些链接及其目标不会被训练代码修改。
+模型应位于 `toolhcl_links/models/Meta-Llama-3-8B`。Transaction 数据链接位于 `toolhcl_links/transaction`。链接和目标文件不会被训练代码修改。
 
-## 运行 V2
+## 运行
 
-先运行单元测试：
+单元测试：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-真实模型 smoke test：
-
-```bash
-PYTHON_BIN="$PWD/.venv/bin/python" \
-ARTIFACT_ROOT=/path/to/ewcdr_artifacts \
-GPU_ID=0 \
-bash scripts/smoke_test_toolhcl_ewcdr_v2.sh
-```
-
-完整 selection、全量重训和正式评估：
-
-```bash
-PYTHON_BIN="$PWD/.venv/bin/python" \
-ARTIFACT_ROOT=/path/to/ewcdr_artifacts \
-GPU_ID=0 \
-bash scripts/run_toolhcl_ewcdr_v2.sh
-```
-
-未设置 `GPU_ID` 时脚本通过 `nvidia-smi` 选择满足显存和利用率阈值的 GPU。只重新评估现有运行：
+真实模型 smoke test（base -> task1，少量样本）：
 
 ```bash
 PYTHON_BIN="$PWD/.venv/bin/python" GPU_ID=0 \
-bash scripts/eval_toolhcl_ewcdr_v2.sh /path/to/run
+bash scripts/smoke_test_toolhcl_ewcdr_transaction_calibrated_currentce.sh
 ```
 
-唯一正式配置为 [`configs/toolhcl_ewcdr_v2.yaml`](configs/toolhcl_ewcdr_v2.yaml)。
+完整 5-stage、每阶段 5 epoch 训练和评估：
+
+```bash
+PYTHON_BIN="$PWD/.venv/bin/python" GPU_ID=0 \
+TRANSACTION_ARTIFACT_ROOT=/path/to/artifacts/transaction \
+bash scripts/run_toolhcl_ewcdr_transaction_calibrated_currentce_5epoch.sh
+```
+
+未指定 `GPU_ID` 时，脚本通过 `nvidia-smi` 选择满足空闲显存和利用率阈值的 GPU。重新评估现有运行：
+
+```bash
+PYTHON_BIN="$PWD/.venv/bin/python" GPU_ID=0 \
+bash scripts/eval_toolhcl_ewcdr_transaction_calibrated_currentce.sh /path/to/run
+```
+
+正式配置为 [`configs/toolhcl_ewcdr_transaction_calibrated_currentce_5epoch.yaml`](configs/toolhcl_ewcdr_transaction_calibrated_currentce_5epoch.yaml)。配置使用仓库相对路径；大型缓存和运行产物默认写入 `artifacts/transaction`，也可通过脚本环境变量重定向。
 
 ## 输出
 
 ```text
 <run>/
-├── checkpoints/{base,task1,task2,task3}.pt
-├── importance/importance_{base,task1,task2}.pt
-├── selection/{config,training_summary}.json
-├── selection_manifest.json
+├── checkpoints/{base,task1,task2,task3,task4}.pt
+├── importance/importance_{base,task1,task2,task3}.pt
 ├── logs/{full_pipeline,train,evaluate}.log
 ├── config.json
 ├── training_summary.json
@@ -175,35 +180,36 @@ bash scripts/eval_toolhcl_ewcdr_v2.sh /path/to/run
 └── summary.md
 ```
 
-checkpoint、importance、LLaMA 权重、ToolHCL 数据和特征缓存不提交 Git。seed 42 的轻量结果与审计文件保存在 [`results/v2_validated_seed42`](results/v2_validated_seed42)。
+checkpoint、importance、模型、数据和特征缓存由 `.gitignore` 排除。
 
-## 已验证结果
+## Seed 42 结果
 
-Global eval：
+V6 的 `task4.pt`：
 
-| checkpoint | R@1 | R@3 | R@5 | NDCG@1 | NDCG@3 | NDCG@5 | MRR |
+| eval split | R@1 | R@3 | R@5 | NDCG@1 | NDCG@3 | NDCG@5 | MRR |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| base | 20.4282 | 47.8166 | 57.1880 | 20.4282 | 36.4567 | 40.3335 | 36.4720 |
-| task1 | 6.8047 | 14.4796 | 18.4003 | 6.8047 | 11.2538 | 12.8683 | 12.5827 |
-| task2 | 2.8950 | 5.7350 | 7.2806 | 2.8950 | 4.5381 | 5.1744 | 5.3461 |
-| task3 | 3.0709 | 6.2659 | 8.0912 | 3.0709 | 4.9191 | 5.6669 | 6.0120 |
+| base | 11.4631 | 27.7790 | 35.6265 | 11.4631 | 20.9560 | 24.1888 | 23.2246 |
+| task1 | 8.5841 | 25.5517 | 35.1247 | 8.5841 | 18.3194 | 22.2777 | 21.4497 |
+| task2 | 14.0900 | 35.7218 | 46.5753 | 14.0900 | 26.5733 | 31.0392 | 28.9645 |
+| task3 | 30.0056 | 54.8155 | 63.7848 | 30.0056 | 44.5639 | 48.2645 | 45.1263 |
+| task4 | 53.8136 | 71.7563 | 77.6739 | 53.8136 | 64.4780 | 66.9260 | 64.4245 |
 
-完整 seen-task matrix、训练耗时、importance 统计和数据审计见 [`summary.md`](results/v2_validated_seed42/summary.md)。这是单个 seed 的已验证复现结果；论文级结论仍需相同协议下的 SeqFT、vanilla EWC 和多随机种子统计。
+最终 global eval：R@1 `17.6839`、R@3 `35.6530`、R@5 `43.8979`、MRR `30.1042`。最终五任务宏平均 R@1 为 `23.5913`；平均 R@1 forgetting 为 `31.3216` 个百分点。
+
+完整轻量结果见 [`results/toolret_v6_seed42`](results/toolret_v6_seed42)。这是单 seed 实验；论文级结论仍需 matched SeqFT、vanilla EWC、严格 current-CE EWC-DR 和多个随机种子。
 
 ## 代码结构
 
 ```text
 toolhcl_ewcdr_pure/
-├── data.py               # ToolHCL 解析、全局 tool mapping、验证划分
-├── model.py              # 冻结 LLaMA、projection、累计 classifier
-├── cache.py              # 完整 LLaMA final hidden-state 缓存
-├── ewcdr.py              # reversed-logits importance、snapshot、EWC loss
-├── train.py              # selection/full-data 共用训练循环
-├── validated_pipeline.py # selection -> fresh full-data retrain -> eval
-├── evaluate.py           # seen matrix 和 global eval
-├── metrics.py            # Recall/NDCG/MRR
-├── verify.py             # 数据、结构、importance 和正则验证
-└── precompute.py         # 可选缓存预计算
+├── data.py       # Transaction 解析、去泄露、global tool ID
+├── cache.py      # 完整冻结 LLaMA final hidden-state 缓存
+├── model.py      # query projection 和累计 classifier
+├── ewcdr.py      # reversed-logits importance、snapshot、EWC loss
+├── train.py      # V6 calibrated current-stage CE 和阶段训练
+├── evaluate.py   # seen matrix、global eval、结果汇总
+├── metrics.py    # Recall/NDCG/MRR 和确定性 tie ranking
+└── verify.py     # 数据、模型、importance 和正则审计
 ```
 
-许可证见 [LICENSE.txt](LICENSE.txt)。ToolHCL 数据、ToolBench 数据和 Meta Llama 权重仍分别受其原始许可约束。
+许可证见 [LICENSE.txt](LICENSE.txt)。

@@ -14,17 +14,20 @@ from torch.optim import AdamW
 from torch.utils.data import Subset
 from tqdm import tqdm
 
-from .cache import build_feature_cache, cache_is_valid, load_feature_dataset
+from .cache import build_feature_cache, build_subset_feature_cache, cache_is_valid, load_feature_dataset
 from .data import (
     FeatureDataset,
     build_global_eval_samples,
     build_stage_samples,
+    eval_decontamination_keys,
     load_stage_tools,
     make_loader,
+    normalized_query,
     sample_by_tool,
     stratified_train_validation_indices,
 )
 from .ewcdr import (
+    accumulate_class_ratio,
     accumulate_online,
     compute_importance,
     drift_summary,
@@ -44,7 +47,6 @@ from .model import (
 )
 from .metrics import RetrievalMetrics
 from .utils import (
-    STAGES,
     autocast_context,
     dataloader_options,
     ensure_dir,
@@ -52,6 +54,8 @@ from .utils import (
     load_config,
     load_json,
     project_root,
+    protocol_stages,
+    protocol_old_tool_counts,
     resolve_device,
     resolve_path,
     resolve_precision,
@@ -77,6 +81,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    stages = protocol_stages(config)
     if args.output_dir:
         config["project"]["output_dir"] = args.output_dir
     if args.method:
@@ -89,7 +94,7 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
         if args.epochs <= 0:
             raise ValueError("--epochs must be positive")
         config["training"]["stage_epochs"] = {
-            stage: {"min": args.epochs, "max": args.epochs} for stage in STAGES
+            stage: {"min": args.epochs, "max": args.epochs} for stage in stages
         }
     if args.max_train_samples is not None:
         config["training"]["max_train_samples"] = args.max_train_samples
@@ -102,6 +107,7 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
     if args.smoke:
         config["runtime"]["smoke"] = True
         config["training"]["stages"] = ["base", "task1"]
+        config["evaluation"]["stages"] = ["base", "task1"]
         config["training"]["max_train_samples"] = int(config["smoke"].get("train_samples_per_stage", 32))
         config["training"]["batch_size"] = int(config["smoke"].get("batch_size", 4))
         config["training"]["stage_epochs"] = {
@@ -152,6 +158,33 @@ def _prepare_caches(
         )
         stage_samples[stage] = samples
         parse_audit["train"][stage] = details
+    decontamination = config.get("data", {}).get("decontamination", {})
+    if bool(decontamination.get("enabled", False)):
+        eval_sources, eval_queries = eval_decontamination_keys(config)
+        residual_queries = sum(
+            normalized_query(sample.query_text) in eval_queries
+            for samples in stage_samples.values()
+            for sample in samples
+        )
+        residual_sources = sum(
+            sample.source_id is not None and sample.source_id in eval_sources
+            for samples in stage_samples.values()
+            for sample in samples
+        )
+        if residual_queries or residual_sources:
+            raise RuntimeError(
+                "Data decontamination failed: "
+                f"residual_queries={residual_queries} residual_sources={residual_sources}"
+            )
+        parse_audit["decontamination"] = {
+            "enabled": True,
+            "policy": "preserve_all_eval_remove_train_matching_any_eval_source_or_normalized_query",
+            "query_normalization": "strip_casefold_collapse_whitespace",
+            "eval_unique_source_ids": len(eval_sources),
+            "eval_unique_normalized_queries": len(eval_queries),
+            "residual_train_eval_source_overlap": residual_sources,
+            "residual_train_eval_normalized_query_overlap": residual_queries,
+        }
     prepare_global_eval = bool(config.get("cache", {}).get("prepare_global_eval", True))
     global_samples: list[Any] = []
     if prepare_global_eval:
@@ -172,6 +205,8 @@ def _prepare_caches(
     hidden_size = int(config["model"].get("hidden_size", 4096))
     max_length = int(config["model"].get("max_length", 512))
     missing_specs: list[tuple[str, Any]] = []
+    reuse_root_value = config.get("cache", {}).get("reuse_train_cache_root")
+    reuse_root = resolve_path(reuse_root_value, project_root(config)) if reuse_root_value else None
     for name, samples in cache_specs:
         cache_dir = cache_root / name
         if cache_is_valid(cache_dir, samples, hidden_size, max_length):
@@ -179,6 +214,30 @@ def _prepare_caches(
             cache_metadata[name] = {"path": str(cache_dir), **manifest}
             logger.info("reusing frozen-encoder feature cache without loading LLaMA: %s", cache_dir)
         else:
+            derived = None
+            if reuse_root is not None and name.endswith("_train"):
+                stage = name[:-6]
+                unfiltered_samples, _ = build_stage_samples(
+                    config,
+                    stage,
+                    "train",
+                    records=records,
+                    max_samples=None,
+                    apply_decontamination=False,
+                )
+                derived = build_subset_feature_cache(
+                    reuse_root / name,
+                    unfiltered_samples,
+                    samples,
+                    cache_dir,
+                    hidden_size=hidden_size,
+                    max_length=max_length,
+                    shard_size=int(config["cache"].get("shard_size", 4096)),
+                    logger=logger,
+                )
+            if derived is not None:
+                cache_metadata[name] = {"path": str(cache_dir), **derived}
+                continue
             missing_specs.append((name, samples))
     try:
         if missing_specs:
@@ -196,6 +255,7 @@ def _prepare_caches(
                 shard_size=int(config["cache"].get("shard_size", 4096)),
                 dataloader_options=options,
                 logger=logger,
+                length_bucketed=bool(config["cache"].get("length_bucketed", False)),
             )
             cache_metadata[name] = {"path": str(cache_dir), **manifest}
     finally:
@@ -229,9 +289,28 @@ def _cache_regularizer(values: Mapping[str, torch.Tensor] | None, device: torch.
 def classification_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
+    *,
+    first_class: int = 0,
+    global_ce_weight: float = 0.0,
 ) -> tuple[torch.Tensor, int]:
-    """Compute CE over every tool visible at the current continual stage."""
-    return F.cross_entropy(logits.float(), targets).float(), int(logits.shape[1])
+    """Compute current-stage CE with an optional global calibration term."""
+    start = int(first_class)
+    if start < 0 or start >= int(logits.shape[1]):
+        raise ValueError(f"Invalid first_class={start} for {logits.shape[1]} logits")
+    if bool(torch.any(targets < start)) or bool(torch.any(targets >= logits.shape[1])):
+        raise ValueError(
+            f"Targets must lie in [{start}, {logits.shape[1]}) for the active CE slice"
+        )
+    calibration_weight = float(global_ce_weight)
+    if calibration_weight < 0.0 or calibration_weight > 1.0:
+        raise ValueError(f"global_ce_weight must lie in [0, 1], got {calibration_weight}")
+    active_logits = logits[:, start:]
+    current_loss = F.cross_entropy(active_logits.float(), targets - start).float()
+    if start == 0 or calibration_weight == 0.0:
+        return current_loss, int(active_logits.shape[1])
+    global_loss = F.cross_entropy(logits.float(), targets).float()
+    combined = (1.0 - calibration_weight) * current_loss + calibration_weight * global_loss
+    return combined.float(), int(logits.shape[1])
 
 
 def _materialize_feature_subset(dataset: FeatureDataset, indices: Sequence[int]) -> FeatureDataset:
@@ -303,20 +382,37 @@ def train(config: dict[str, Any]) -> Path:
     set_seed(int(config["training"].get("seed", 42)))
     device = resolve_device(config["runtime"].get("device", "cuda"), config["runtime"].get("gpu"))
     amp_enabled, amp_dtype, precision_name = resolve_precision(config, device, logger)
-    selected_stages = tuple(config["training"].get("stages", STAGES))
-    if any(stage not in STAGES for stage in selected_stages):
+    protocol = protocol_stages(config)
+    selected_stages = tuple(config["training"].get("stages", protocol))
+    if any(stage not in protocol for stage in selected_stages):
         raise ValueError(f"Invalid stages: {selected_stages}")
+    expected_prefix = protocol[: len(selected_stages)]
+    if selected_stages != expected_prefix:
+        raise ValueError(f"Training stages must be a contiguous protocol prefix: {selected_stages}")
     logger.info("pure EWC-DR training device=%s stages=%s output=%s", device, selected_stages, output_dir)
     logger.info("hardware=%s", _hardware())
 
     stage_samples, cache_metadata = _prepare_caches(config, selected_stages, device, logger)
     cache_root = resolve_path(config["cache"]["root"], root)
+    parse_audit = load_json(cache_root / "parse_audit.json")
+    if parse_audit.get("decontamination"):
+        save_json(output_dir / "decontamination_report.json", parse_audit)
     method = str(config["ewcdr"].get("method", "ewc_dr"))
     classification_scope = str(config["training"].get("classification_scope", "all_visible"))
-    if classification_scope != "all_visible":
-        raise ValueError("V2 requires training.classification_scope=all_visible")
+    if classification_scope not in {"all_visible", "current_stage", "current_stage_calibrated"}:
+        raise ValueError(f"Unsupported training.classification_scope={classification_scope}")
+    old_tool_counts = protocol_old_tool_counts(config)
     lambda_ewc = float(config["ewcdr"].get("lambda", 1000.0))
     gamma = float(config["ewcdr"].get("gamma", 1.0))
+    accumulation_mode = str(config["ewcdr"].get("accumulation_mode", "online_gamma"))
+    if accumulation_mode not in {"online_gamma", "official_alpha"}:
+        raise ValueError(f"Unsupported ewcdr.accumulation_mode={accumulation_mode}")
+    importance_scope = str(config["ewcdr"].get("importance_scope", "all_visible"))
+    if importance_scope not in {"all_visible", "current_stage", "training_scope"}:
+        raise ValueError(f"Unsupported ewcdr.importance_scope={importance_scope}")
+    importance_model_mode = str(config["ewcdr"].get("importance_model_mode", "eval"))
+    if importance_model_mode not in {"train", "eval"}:
+        raise ValueError(f"Unsupported ewcdr.importance_model_mode={importance_model_mode}")
     resume = bool(config["runtime"].get("resume", False))
     save_final_importance = bool(config["ewcdr"].get("save_final_importance", False))
     validation_config = config["training"].get("validation", {})
@@ -333,6 +429,12 @@ def train(config: dict[str, Any]) -> Path:
     validation_datasets: dict[str, FeatureDataset] = {}
     validation_split_reports: dict[str, Any] = {}
     logger.info("classification_scope=%s", classification_scope)
+    logger.info(
+        "importance_scope=%s importance_model_mode=%s accumulation_mode=%s",
+        importance_scope,
+        importance_model_mode,
+        accumulation_mode,
+    )
     logger.info(
         "checkpoint_selection=%s validation_enabled=%s", checkpoint_selection, validation_enabled
     )
@@ -383,7 +485,9 @@ def train(config: dict[str, Any]) -> Path:
         model = build_retriever(config, stage, encoder=None).to(device)
         inheritance = None
         if previous_checkpoint is not None:
-            inheritance = initialize_from_previous(model, previous_checkpoint, stage, verify_exact=True)
+            inheritance = initialize_from_previous(
+                model, previous_checkpoint, stage, config=config, verify_exact=True
+            )
             logger.info("verified exact inherited classifier prefix for stage=%s old_tools=%s", stage, inheritance["num_tools"])
         names = list(named_trainable_parameters(model))
         expected_prefixes = ("query_projection.", "classifier.")
@@ -391,6 +495,30 @@ def train(config: dict[str, Any]) -> Path:
         if unexpected:
             raise AssertionError(f"Unexpected trainable parameters: {unexpected}")
         logger.info("stage=%s trainable=%s", stage, trainable_summary(model))
+        classification_first = (
+            int(old_tool_counts.get(stage, 0))
+            if classification_scope in {"current_stage", "current_stage_calibrated"}
+            else 0
+        )
+        global_ce_weight = 0.0
+        if classification_scope == "current_stage_calibrated" and classification_first > 0:
+            configured_weight = config["training"].get("global_ce_weight", "class_ratio")
+            if str(configured_weight).lower() == "class_ratio":
+                global_ce_weight = (model.num_tools - classification_first) / model.num_tools
+            else:
+                global_ce_weight = float(configured_weight)
+            if global_ce_weight <= 0.0 or global_ce_weight >= 1.0:
+                raise ValueError(
+                    "Calibrated current-stage CE requires global_ce_weight in (0, 1), "
+                    f"got {global_ce_weight}"
+                )
+        logger.info(
+            "stage=%s CE classifier rows=[%s,%s) global_ce_weight=%.6f",
+            stage,
+            classification_first,
+            model.num_tools,
+            global_ce_weight,
+        )
 
         loader = _loader(dataset, config, shuffle=True)
         optimizer = AdamW(
@@ -431,7 +559,12 @@ def train(config: dict[str, Any]) -> Path:
                 with autocast_context(device, amp_enabled, amp_dtype):
                     logits = model.forward_batch(batch, device)
                 targets = batch["tool_id"].to(device, non_blocking=True)
-                ce_loss, classification_candidates = classification_loss(logits, targets)
+                ce_loss, classification_candidates = classification_loss(
+                    logits,
+                    targets,
+                    first_class=classification_first,
+                    global_ce_weight=global_ce_weight,
+                )
                 if stage_position == 0 or method == "seq_ft":
                     ewc_loss = torch.zeros((), device=device, dtype=torch.float32)
                 else:
@@ -470,6 +603,8 @@ def train(config: dict[str, Any]) -> Path:
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "classification_scope": classification_scope,
                 "classification_candidates": classification_candidates,
+                "classification_first_class": classification_first,
+                "global_ce_weight": global_ce_weight,
                 "batches": batches,
                 "samples": samples_seen,
                 "duration_sec": round(time.time() - epoch_started, 3),
@@ -517,6 +652,7 @@ def train(config: dict[str, Any]) -> Path:
                         "feature_cache": str(cache_root / f"{stage}_train"),
                         "classification_scope": classification_scope,
                         "classification_candidates": classification_candidates,
+                        "global_ce_weight": global_ce_weight,
                         "checkpoint_selection": checkpoint_selection,
                         "selection_score": (
                             row.get("validation", {}).get("selection_score")
@@ -578,6 +714,7 @@ def train(config: dict[str, Any]) -> Path:
                 "feature_cache": str(cache_root / f"{stage}_train"),
                 "classification_scope": classification_scope,
                 "classification_candidates": history[-1]["classification_candidates"],
+                "global_ce_weight": global_ce_weight,
                 "checkpoint_selection": checkpoint_selection,
                 "selection_score": (
                     history[best_epoch - 1].get("validation", {}).get("selection_score")
@@ -604,6 +741,11 @@ def train(config: dict[str, Any]) -> Path:
             full_selected_indices = [train_indices[index] for index in selected_indices]
             importance_dataset = Subset(full_dataset, full_selected_indices)
             importance_loader = _loader(importance_dataset, config, shuffle=False, importance=True)
+            importance_first = (
+                classification_first
+                if importance_scope in {"current_stage", "training_scope"}
+                else 0
+            )
             importance_started = time.time()
             current_importance, importance_report = compute_importance(
                 model,
@@ -616,9 +758,22 @@ def train(config: dict[str, Any]) -> Path:
                 accumulation_device=config["ewcdr"].get("accumulation_device", "cuda"),
                 omega_max=config["ewcdr"].get("omega_max"),
                 verify_unchanged=bool(config["ewcdr"].get("verify_unchanged", False)),
+                first_class=importance_first,
+                model_mode=importance_model_mode,
             )
             importance_duration = time.time() - importance_started
-            accumulated = accumulate_online(accumulated, current_importance, gamma)
+            accumulation_alpha = None
+            if accumulation_mode == "official_alpha":
+                accumulation_alpha = (
+                    float(old_tool_counts[stage]) / float(model.num_tools)
+                    if accumulated is not None and stage in old_tool_counts
+                    else 0.0
+                )
+                accumulated = accumulate_class_ratio(
+                    accumulated, current_importance, accumulation_alpha
+                )
+            else:
+                accumulated = accumulate_online(accumulated, current_importance, gamma)
             snapshot = parameter_snapshot(model)
             save_importance(
                 importance_path,
@@ -633,6 +788,12 @@ def train(config: dict[str, Any]) -> Path:
                     "importance": importance_report,
                     "duration_sec": round(importance_duration, 3),
                     "omega_max": config["ewcdr"].get("omega_max"),
+                    "classification_scope": classification_scope,
+                    "importance_scope": importance_scope,
+                    "importance_first_class": importance_first,
+                    "importance_model_mode": importance_model_mode,
+                    "accumulation_mode": accumulation_mode,
+                    "accumulation_alpha": accumulation_alpha,
                 },
             )
             logger.info("saved importance: %s", importance_path)
@@ -660,6 +821,7 @@ def train(config: dict[str, Any]) -> Path:
             "trainable": trainable_summary(model),
             "classification_scope": classification_scope,
             "classification_candidates": history[-1]["classification_candidates"],
+            "global_ce_weight": global_ce_weight,
         }
         stage_summaries = [row for row in stage_summaries if row.get("stage") != stage]
         stage_summaries.append(summary)
@@ -668,6 +830,14 @@ def train(config: dict[str, Any]) -> Path:
             {
                 "method": method,
                 "classification_scope": classification_scope,
+                "global_ce_weight": config["training"].get("global_ce_weight"),
+                "ewcdr": {
+                    "lambda": lambda_ewc,
+                    "gamma": gamma,
+                    "accumulation_mode": accumulation_mode,
+                    "importance_scope": importance_scope,
+                    "importance_model_mode": importance_model_mode,
+                },
                 "hardware": _hardware(),
                 "precision": precision_name,
                 "feature_cache": cache_metadata,

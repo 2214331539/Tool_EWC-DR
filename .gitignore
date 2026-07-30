@@ -23,6 +23,7 @@ toolhcl_ewcdr_runs*
 /toolhcl_ewcdr_v2
 /toolhcl_ewcdr_v2*/
 /toolhcl_seqft_*/
+/transaction_*
 checkpoints/
 logs/
 wandb/

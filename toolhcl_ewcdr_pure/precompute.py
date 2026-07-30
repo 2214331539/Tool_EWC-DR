@@ -7,7 +7,7 @@ import torch
 from .cache import build_feature_cache
 from .data import build_global_eval_samples, build_stage_samples, load_stage_tools
 from .model import load_frozen_encoder
-from .utils import STAGES, dataloader_options, load_config, project_root, resolve_device, resolve_path, setup_logging
+from .utils import dataloader_options, load_config, project_root, protocol_stages, resolve_device, resolve_path, setup_logging
 
 
 def main() -> None:
@@ -20,12 +20,13 @@ def main() -> None:
     device = resolve_device(config["runtime"].get("device", "cuda"), config["runtime"].get("gpu"))
     logger = setup_logging(resolve_path(args.log_dir, project_root(config)), "precompute")
     records = load_stage_tools(config)
+    stages = protocol_stages(config)
     requested = [value.strip() for value in args.splits.split(",") if value.strip()]
     specs = []
     for name in requested:
         if name == "global_eval":
             samples, _ = build_global_eval_samples(config, records=records)
-        elif name.endswith("_train") and name[:-6] in STAGES:
+        elif name.endswith("_train") and name[:-6] in stages:
             samples, _ = build_stage_samples(config, name[:-6], "train", records=records)
         else:
             raise ValueError(f"Unsupported cache split: {name}")
@@ -42,6 +43,7 @@ def main() -> None:
                 shard_size=int(config["cache"].get("shard_size", 4096)),
                 dataloader_options=dataloader_options(config, "cache"),
                 logger=logger,
+                length_bucketed=bool(config["cache"].get("length_bucketed", False)),
             )
     finally:
         del encoder

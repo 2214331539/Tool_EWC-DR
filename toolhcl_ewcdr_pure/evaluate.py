@@ -13,16 +13,16 @@ from tqdm import tqdm
 from .cache import build_feature_cache, cache_is_valid, load_feature_dataset
 from .data import build_global_eval_samples, load_stage_tools, make_loader
 from .ewcdr import load_importance
-from .metrics import METRIC_NAMES, PREDICTION_STAGE_METRIC_NAMES, PredictionStageMetrics, RetrievalMetrics
+from .metrics import METRIC_NAMES, PredictionStageMetrics, RetrievalMetrics, prediction_stage_metric_names
 from .model import build_retriever, load_checkpoint, load_frozen_encoder
 from .utils import (
-    EXPECTED_TOOL_COUNTS,
-    STAGES,
     autocast_context,
     dataloader_options,
     ensure_dir,
     load_config,
     project_root,
+    protocol_stages,
+    protocol_tool_counts,
     resolve_device,
     resolve_path,
     resolve_precision,
@@ -59,14 +59,14 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
     return config
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], stages: Sequence[str]) -> None:
     fields = [
         "checkpoint",
         "eval_split",
         "samples",
         "candidates",
         *METRIC_NAMES,
-        *PREDICTION_STAGE_METRIC_NAMES,
+        *prediction_stage_metric_names(stages),
     ]
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -106,6 +106,7 @@ def _ensure_eval_cache(config: Mapping[str, Any], device: torch.device, logger) 
                 shard_size=int(config["cache"].get("shard_size", 4096)),
                 dataloader_options=dataloader_options(config, "cache"),
                 logger=logger,
+                length_bucketed=bool(config["cache"].get("length_bucketed", False)),
             )
         finally:
             del encoder
@@ -125,12 +126,18 @@ def evaluate_checkpoint(
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
     topk: Sequence[int],
+    stages: Sequence[str],
+    tool_counts: Mapping[str, int],
 ) -> dict[str, dict[str, Any]]:
-    candidate_count = EXPECTED_TOOL_COUNTS[checkpoint_stage]
+    candidate_count = int(tool_counts[checkpoint_stage])
     accumulators = {"global": RetrievalMetrics(topk)}
-    accumulators.update({stage: RetrievalMetrics(topk) for stage in STAGES})
-    prediction_accumulators = {"global": PredictionStageMetrics()}
-    prediction_accumulators.update({stage: PredictionStageMetrics() for stage in STAGES})
+    accumulators.update({stage: RetrievalMetrics(topk) for stage in stages})
+    prediction_accumulators = {
+        "global": PredictionStageMetrics(stages, dict(tool_counts))
+    }
+    prediction_accumulators.update(
+        {stage: PredictionStageMetrics(stages, dict(tool_counts)) for stage in stages}
+    )
     model.eval()
     for batch in tqdm(loader, desc=f"pure eval {checkpoint_stage}", dynamic_ncols=True, mininterval=2.0):
         with autocast_context(device, amp_enabled, amp_dtype):
@@ -138,7 +145,7 @@ def evaluate_checkpoint(
         targets = batch["tool_id"].to(device, non_blocking=True)
         accumulators["global"].update(logits, targets, candidate_count)
         prediction_accumulators["global"].update(logits, candidate_count)
-        for source_stage in STAGES:
+        for source_stage in stages:
             indices = [index for index, value in enumerate(batch["source_stage"]) if value == source_stage]
             if indices:
                 index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
@@ -157,9 +164,9 @@ def evaluate_checkpoint(
     }
 
 
-def _importance_rows(output_dir: Path) -> list[dict[str, Any]]:
+def _importance_rows(output_dir: Path, stages: Sequence[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for stage in STAGES[:-1]:
+    for stage in stages[:-1]:
         path = output_dir / "importance" / f"importance_{stage}.pt"
         if not path.exists():
             continue
@@ -169,7 +176,7 @@ def _importance_rows(output_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_summary(
+def _write_legacy_summary(
     output_dir: Path,
     config: Mapping[str, Any],
     global_rows: Sequence[Mapping[str, Any]],
@@ -372,13 +379,190 @@ def _write_summary(
     (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_summary(
+    output_dir: Path,
+    config: Mapping[str, Any],
+    global_rows: Sequence[Mapping[str, Any]],
+    matrix_rows: Sequence[Mapping[str, Any]],
+    evaluation_duration: float,
+) -> None:
+    stages = protocol_stages(config)
+    tool_counts = protocol_tool_counts(config)
+    final_stage = stages[-1]
+    training_path = output_dir / "training_summary.json"
+    training = json.load(open(training_path, encoding="utf-8")) if training_path.exists() else {}
+    parse_audit_path = resolve_path(config["cache"]["root"], project_root(config)) / "parse_audit.json"
+    parse_audit = json.load(open(parse_audit_path, encoding="utf-8")) if parse_audit_path.exists() else {}
+    importance_rows = _importance_rows(output_dir, stages)
+    final = next((row for row in global_rows if row["checkpoint"] == final_stage), None)
+    matrix_index = {(row["checkpoint"], row["eval_split"]): row for row in matrix_rows}
+    increments = [tool_counts[stages[0]]] + [
+        tool_counts[stages[index]] - tool_counts[stages[index - 1]]
+        for index in range(1, len(stages))
+    ]
+    overlap_enabled = bool(config.get("evaluation", {}).get("filter_train_query_overlap", False))
+    decontamination = config.get("data", {}).get("decontamination", {})
+    decontamination_enabled = bool(decontamination.get("enabled", False))
+    classification_scope = str(config.get("training", {}).get("classification_scope", "all_visible"))
+    ewcdr_config = config.get("ewcdr", {})
+    importance_scope = str(ewcdr_config.get("importance_scope", "all_visible"))
+    importance_model_mode = str(ewcdr_config.get("importance_model_mode", "eval"))
+    accumulation_mode = str(ewcdr_config.get("accumulation_mode", "online_gamma"))
+    importance_scope_description = (
+        "all classifier rows visible at the stage"
+        if importance_scope == "all_visible"
+        else "the current stage classifier slice"
+    )
+    accumulation_description = (
+        "Historical and current importance use the official class-count alpha blend."
+        if accumulation_mode == "official_alpha"
+        else f"Historical importance uses online gamma accumulation with gamma={float(ewcdr_config.get('gamma', 1.0)):g}."
+    )
+    lines = [
+        "# Pure ToolHCL EWC-DR Baseline",
+        "",
+        "## Method And Data Flow",
+        "",
+        "`query -> complete frozen LLaMA forward -> last valid-token hidden state -> 4096->1024->384 query projection -> cumulative global linear classifier -> ranked global tool IDs`.",
+        "",
+        "Frozen LLaMA hidden states are cached once and reused exactly across epochs. Normal training and evaluation use original logits. Post-stage importance alone uses `reversed_logits = -logits` over "
+        + importance_scope_description
+        + f" in `{importance_model_mode}` mode; squared gradients are accumulated in CPU fp32 and no optimizer update occurs during importance estimation. "
+        + accumulation_description,
+        "",
+        "EWC protects every trainable query-projection tensor and the historical prefix of classifier weight/bias. The frozen LLaMA backbone is excluded because `requires_grad=False`; newly added classifier rows have no historical penalty until their stage importance is accumulated.",
+        "",
+        "## Continual Protocol",
+        "",
+        f"Stages: {' -> '.join(stages)}. Cumulative visible tools: "
+        + ", ".join(f"{stage}={tool_counts[stage]:,}" for stage in stages)
+        + ". Incremental additions: "
+        + ", ".join(f"{stage}=+{count:,}" for stage, count in zip(stages, increments))
+        + ".",
+        "",
+        (
+            "Every incremental stage uses CE only over its newly introduced tool rows, matching the official EWC-DR class-incremental objective; base CE covers every base row. Evaluation always ranks every tool visible at the checkpoint."
+            if classification_scope == "current_stage"
+            else (
+                "Incremental task loss is a convex combination dominated by current-stage CE plus a weak all-visible calibration CE. The global term weight is the deterministic new-tool/visible-tool class ratio; evaluation still ranks unchanged original logits over every visible tool."
+                if classification_scope == "current_stage_calibrated"
+                else "Every stage uses CE over all tools visible at that stage. Evaluation uses the same visible global candidate space."
+            )
+        ),
+        "",
+        (
+            "Data decontamination is enabled: every original eval row is preserved, while a train row is removed when its source_id or whitespace-normalized case-folded query occurs in any stage's eval split. The source files and visible candidate dictionary are unchanged."
+            if decontamination_enabled
+            else f"Legacy evaluation train-query overlap filtering is `{overlap_enabled}`."
+        ),
+        "",
+        "## Training",
+        "",
+        "| stage | epochs | final CE | final EWC | final total | avg epoch sec | importance sec | stop reason |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in training.get("stages", []):
+        final_epoch = row["final_epoch"]
+        lines.append(
+            f"| {row['stage']} | {row['completed_epochs']} | {final_epoch['ce_loss']:.6f} | "
+            f"{final_epoch['ewc_loss']:.6f} | {final_epoch['total_loss']:.6f} | "
+            f"{row['train_duration_sec'] / max(1, row['completed_epochs']):.3f} | "
+            f"{row['importance_duration_sec']:.1f} | {row['stop_reason']} |"
+        )
+    cache_metadata = training.get("feature_cache", {})
+    if cache_metadata:
+        lines.extend([
+            "",
+            "## Frozen Encoder Cache",
+            "",
+            f"Encoder batch size: {int(config.get('cache', {}).get('encoder_batch_size', 0))}; "
+            f"length-bucketed encoding: `{bool(config.get('cache', {}).get('length_bucketed', False))}`. "
+            "Length bucketing is used only for the frozen LLaMA forward; hidden states are written back in original sample order before training.",
+            "",
+            "| cache split | samples | duration sec | shards |",
+            "| --- | ---: | ---: | ---: |",
+        ])
+        for name, values in cache_metadata.items():
+            lines.append(
+                f"| {name} | {int(values.get('samples', 0))} | "
+                f"{float(values.get('duration_sec', 0.0)):.1f} | {len(values.get('shards', []))} |"
+            )
+    lines.extend(["", "## Data Audit", "", "| split | raw | parsed | decontamination removed | legacy eval removed | other excluded |", "| --- | ---: | ---: | ---: | ---: | ---: |"])
+    for stage in stages:
+        train_parse = parse_audit.get("train", {}).get(stage, {}).get("parse", {})
+        if train_parse:
+            raw, parsed = int(train_parse.get("raw", 0)), int(train_parse.get("parsed", 0))
+            removed = int(train_parse.get("excluded_eval_source_or_query_overlap", 0))
+            lines.append(f"| {stage}_train | {raw} | {parsed} | {removed} | 0 | {raw - parsed - removed} |")
+    for stage, values in parse_audit.get("global_eval", {}).get("per_stage", {}).items():
+        raw, parsed = int(values.get("raw", 0)), int(values.get("parsed", 0))
+        overlap = int(values.get("excluded_train_query_overlap", 0))
+        lines.append(f"| {stage}_eval | {raw} | {parsed} | 0 | {overlap} | {raw - parsed - overlap} |")
+    if parse_audit.get("decontamination"):
+        audit = parse_audit["decontamination"]
+        lines.extend([
+            "",
+            f"Decontamination residuals: source_id={int(audit.get('residual_train_eval_source_overlap', -1))}, normalized_query={int(audit.get('residual_train_eval_normalized_query_overlap', -1))}. Eval unique source IDs={int(audit.get('eval_unique_source_ids', 0)):,}; normalized queries={int(audit.get('eval_unique_normalized_queries', 0)):,}.",
+        ])
+    lines.extend(["", "## Importance", ""])
+    if importance_rows:
+        lines.extend(["| stage | parameter | numel | nonzero | mean | max |", "| --- | --- | ---: | ---: | ---: | ---: |"])
+        for row in importance_rows:
+            lines.append(
+                f"| {row['stage']} | {row['name']} | {row['numel']} | {row['nonzero']} | "
+                f"{row['mean']:.6g} | {row['max']:.6g} |"
+            )
+    lines.extend(["", "## Global Eval", "", _markdown_table(global_rows), "", "## Seen Task Matrix", "", _markdown_table(matrix_rows), ""])
+    prediction_fields = [f"top1_pred_{stage}_percent" for stage in stages]
+    if matrix_rows and all(field in matrix_rows[0] for field in prediction_fields):
+        lines.extend(["## Top-1 Prediction Stage Distribution", "", "| checkpoint | eval split | " + " | ".join(stages) + " |", "| --- | --- | " + " | ".join(["---:"] * len(stages)) + " |"])
+        for row in matrix_rows:
+            values = " | ".join(f"{row[field]:.4f}" for field in prediction_fields)
+            lines.append(f"| {row['checkpoint']} | {row['eval_split']} | {values} |")
+        lines.append("")
+    lines.extend(["## Interpretation", "", f"Complete evaluation duration: {evaluation_duration:.1f} seconds."])
+    if final:
+        lines.extend(["", f"Final `{final_stage}.pt` global: R@1={final['Recall@1']:.4f}, R@3={final['Recall@3']:.4f}, R@5={final['Recall@5']:.4f}, NDCG@1={final['NDCG@1']:.4f}, NDCG@3={final['NDCG@3']:.4f}, NDCG@5={final['NDCG@5']:.4f}, MRR={final['MRR']:.4f}."])
+        forgetting = []
+        standard_forgetting: list[float] = []
+        for stage in stages[:-1]:
+            initial = matrix_index.get((stage, stage), {}).get("Recall@1")
+            last = matrix_index.get((final_stage, stage), {}).get("Recall@1")
+            if initial is not None and last is not None:
+                forgetting.append(f"{stage} R@1 {initial:.4f}->{last:.4f}")
+                stage_position = stages.index(stage)
+                eligible = [
+                    float(row["Recall@1"])
+                    for row in matrix_rows
+                    if row["eval_split"] == stage
+                    and stages.index(str(row["checkpoint"])) >= stage_position
+                ]
+                if eligible:
+                    standard_forgetting.append(max(eligible) - float(last))
+        if forgetting:
+            lines.extend(["", "Forgetting at the final checkpoint: " + ", ".join(forgetting) + "."])
+        if standard_forgetting:
+            lines.extend([
+                "",
+                "Standard average Recall@1 forgetting (best observed seen-task score minus final score): "
+                f"{sum(standard_forgetting) / len(standard_forgetting):.4f} percentage points.",
+            ])
+    (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def evaluate(config: dict[str, Any]) -> Path:
     root = project_root(config)
     output_dir = resolve_path(config["project"]["output_dir"], root)
     ensure_dir(output_dir)
     logger = setup_logging(output_dir, "evaluate")
     device = resolve_device(config["runtime"].get("device", "cuda"), config["runtime"].get("gpu"))
-    amp_enabled, amp_dtype, precision_name = resolve_precision(config, device, logger)
+    precision_config = dict(config)
+    precision_config["runtime"] = dict(config.get("runtime", {}))
+    evaluation_precision = config.get("evaluation", {}).get("precision")
+    if evaluation_precision is not None:
+        precision_config["runtime"]["precision"] = str(evaluation_precision)
+    amp_enabled, amp_dtype, precision_name = resolve_precision(precision_config, device, logger)
+    logger.info("formal evaluation precision=%s", precision_name)
     cache_dir, expected_samples = _ensure_eval_cache(config, device, logger)
     dataset, manifest = load_feature_dataset(cache_dir)
     if len(dataset) != expected_samples:
@@ -393,7 +577,11 @@ def evaluate(config: dict[str, Any]) -> Path:
     checkpoint_dir = resolve_path(
         config["evaluation"].get("checkpoint_dir") or str(output_dir / "checkpoints"), root
     )
-    stages = tuple(config["evaluation"].get("stages", STAGES))
+    protocol = protocol_stages(config)
+    tool_counts = protocol_tool_counts(config)
+    stages = tuple(config["evaluation"].get("stages", protocol))
+    if stages != protocol[: len(stages)]:
+        raise ValueError(f"Evaluation stages must be a contiguous protocol prefix: {stages}")
     topk = tuple(int(value) for value in config["evaluation"].get("topk", [1, 3, 5]))
     global_rows: list[dict[str, Any]] = []
     matrix_rows: list[dict[str, Any]] = []
@@ -409,16 +597,18 @@ def evaluate(config: dict[str, Any]) -> Path:
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             topk=topk,
+            stages=protocol,
+            tool_counts=tool_counts,
         )
         global_rows.append({"checkpoint": checkpoint_stage, "eval_split": "global", **grouped["global"]})
-        for source_stage in STAGES[: STAGES.index(checkpoint_stage) + 1]:
+        for source_stage in protocol[: protocol.index(checkpoint_stage) + 1]:
             matrix_rows.append({"checkpoint": checkpoint_stage, "eval_split": source_stage, **grouped[source_stage]})
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     duration = time.time() - started
-    _write_csv(output_dir / "global_eval.csv", global_rows)
-    _write_csv(output_dir / "eval_matrix.csv", matrix_rows)
+    _write_csv(output_dir / "global_eval.csv", global_rows, protocol)
+    _write_csv(output_dir / "eval_matrix.csv", matrix_rows, protocol)
     save_json(
         output_dir / "metrics.json",
         {

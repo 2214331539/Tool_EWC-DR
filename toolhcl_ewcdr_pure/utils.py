@@ -18,6 +18,37 @@ EXPECTED_TOOL_COUNTS = {"base": 11112, "task1": 11752, "task2": 12392, "task3": 
 EXPECTED_OLD_TOOL_COUNTS = {"task1": 11112, "task2": 11752, "task3": 12392}
 
 
+def protocol_stages(config: Mapping[str, Any]) -> tuple[str, ...]:
+    values = config.get("protocol", {}).get(
+        "stages", config.get("training", {}).get("stages", STAGES)
+    )
+    stages = tuple(str(value) for value in values)
+    if not stages or len(set(stages)) != len(stages):
+        raise ValueError(f"Protocol stages must be a non-empty ordered unique list: {stages}")
+    return stages
+
+
+def protocol_tool_counts(config: Mapping[str, Any]) -> dict[str, int]:
+    stages = protocol_stages(config)
+    configured = config.get("protocol", {}).get("tool_counts")
+    source = configured if configured is not None else EXPECTED_TOOL_COUNTS
+    counts = {stage: int(source[stage]) for stage in stages}
+    previous = 0
+    for stage in stages:
+        if counts[stage] <= previous:
+            raise ValueError(
+                f"Cumulative tool counts must increase at every stage: {stage}={counts[stage]} after {previous}"
+            )
+        previous = counts[stage]
+    return counts
+
+
+def protocol_old_tool_counts(config: Mapping[str, Any]) -> dict[str, int]:
+    stages = protocol_stages(config)
+    counts = protocol_tool_counts(config)
+    return {stages[index]: counts[stages[index - 1]] for index in range(1, len(stages))}
+
+
 def load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -134,7 +165,7 @@ def dataloader_options(config: Mapping[str, Any], section: str) -> dict[str, Any
     }
 
 
-def stage_index(stage: str) -> int:
-    if stage not in STAGES:
+def stage_index(stage: str, stages: tuple[str, ...] = STAGES) -> int:
+    if stage not in stages:
         raise ValueError(f"Unknown stage: {stage}")
-    return STAGES.index(stage)
+    return stages.index(stage)

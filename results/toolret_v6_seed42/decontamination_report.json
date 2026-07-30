@@ -1,0 +1,234 @@
+{
+  "train": {
+    "base": {
+      "parse": {
+        "raw": 220804,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 174613,
+        "target_name_unmapped": 0,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 45636,
+        "excluded_eval_query_overlap": 46191,
+        "excluded_eval_source_or_query_overlap": 46191,
+        "out_of_range": 0,
+        "parsed": 174613
+      },
+      "normalized_name_collisions": 0,
+      "decontamination": {
+        "enabled": true,
+        "policy": "remove_train_if_source_id_or_whitespace_casefold_query_occurs_in_any_eval_split",
+        "eval_unique_source_ids": 60082,
+        "eval_unique_normalized_queries": 59237,
+        "preserve_original_eval": true
+      }
+    },
+    "task1": {
+      "parse": {
+        "raw": 38664,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 30432,
+        "target_name_unmapped": 0,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 8125,
+        "excluded_eval_query_overlap": 8232,
+        "excluded_eval_source_or_query_overlap": 8232,
+        "out_of_range": 0,
+        "parsed": 30432
+      },
+      "normalized_name_collisions": 0,
+      "decontamination": {
+        "enabled": true,
+        "policy": "remove_train_if_source_id_or_whitespace_casefold_query_occurs_in_any_eval_split",
+        "eval_unique_source_ids": 60082,
+        "eval_unique_normalized_queries": 59237,
+        "preserve_original_eval": true
+      }
+    },
+    "task2": {
+      "parse": {
+        "raw": 36798,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 29162,
+        "target_name_unmapped": 92,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 7553,
+        "excluded_eval_query_overlap": 7636,
+        "excluded_eval_source_or_query_overlap": 7636,
+        "out_of_range": 0,
+        "parsed": 29162
+      },
+      "normalized_name_collisions": 0,
+      "decontamination": {
+        "enabled": true,
+        "policy": "remove_train_if_source_id_or_whitespace_casefold_query_occurs_in_any_eval_split",
+        "eval_unique_source_ids": 60082,
+        "eval_unique_normalized_queries": 59237,
+        "preserve_original_eval": true
+      }
+    },
+    "task3": {
+      "parse": {
+        "raw": 39468,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 31233,
+        "target_name_unmapped": 0,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 8139,
+        "excluded_eval_query_overlap": 8235,
+        "excluded_eval_source_or_query_overlap": 8235,
+        "out_of_range": 0,
+        "parsed": 31233
+      },
+      "normalized_name_collisions": 0,
+      "decontamination": {
+        "enabled": true,
+        "policy": "remove_train_if_source_id_or_whitespace_casefold_query_occurs_in_any_eval_split",
+        "eval_unique_source_ids": 60082,
+        "eval_unique_normalized_queries": 59237,
+        "preserve_original_eval": true
+      }
+    },
+    "task4": {
+      "parse": {
+        "raw": 38153,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 30205,
+        "target_name_unmapped": 4,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 7843,
+        "excluded_eval_query_overlap": 7948,
+        "excluded_eval_source_or_query_overlap": 7948,
+        "out_of_range": 0,
+        "parsed": 30205
+      },
+      "normalized_name_collisions": 0,
+      "decontamination": {
+        "enabled": true,
+        "policy": "remove_train_if_source_id_or_whitespace_casefold_query_occurs_in_any_eval_split",
+        "eval_unique_source_ids": 60082,
+        "eval_unique_normalized_queries": 59237,
+        "preserve_original_eval": true
+      }
+    }
+  },
+  "global_eval": {
+    "per_stage": {
+      "base": {
+        "raw": 39771,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 39771,
+        "target_name_unmapped": 0,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 0,
+        "excluded_eval_query_overlap": 0,
+        "excluded_eval_source_or_query_overlap": 0,
+        "out_of_range": 0,
+        "parsed": 39771
+      },
+      "task1": {
+        "raw": 6978,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 6978,
+        "target_name_unmapped": 0,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 0,
+        "excluded_eval_query_overlap": 0,
+        "excluded_eval_source_or_query_overlap": 0,
+        "out_of_range": 0,
+        "parsed": 6978
+      },
+      "task2": {
+        "raw": 6643,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 6643,
+        "target_name_unmapped": 20,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 0,
+        "excluded_eval_query_overlap": 0,
+        "excluded_eval_source_or_query_overlap": 0,
+        "out_of_range": 0,
+        "parsed": 6643
+      },
+      "task3": {
+        "raw": 7102,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 7102,
+        "target_name_unmapped": 0,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 0,
+        "excluded_eval_query_overlap": 0,
+        "excluded_eval_source_or_query_overlap": 0,
+        "out_of_range": 0,
+        "parsed": 7102
+      },
+      "task4": {
+        "raw": 6844,
+        "missing_conversation": 0,
+        "malformed_target": 0,
+        "unmapped_target": 0,
+        "invalid_direct_target": 0,
+        "direct_target": 6844,
+        "target_name_unmapped": 1,
+        "target_name_id_mismatch": 0,
+        "excluded_train_query_overlap": 0,
+        "excluded_eval_source_overlap": 0,
+        "excluded_eval_query_overlap": 0,
+        "excluded_eval_source_or_query_overlap": 0,
+        "out_of_range": 0,
+        "parsed": 6844
+      }
+    },
+    "normalized_name_collisions": 0,
+    "parsed": 67338,
+    "decontamination": {
+      "enabled": true,
+      "preserve_original_eval": true,
+      "legacy_eval_filter_enabled": false
+    }
+  },
+  "decontamination": {
+    "enabled": true,
+    "policy": "preserve_all_eval_remove_train_matching_any_eval_source_or_normalized_query",
+    "query_normalization": "strip_casefold_collapse_whitespace",
+    "eval_unique_source_ids": 60082,
+    "eval_unique_normalized_queries": 59237,
+    "residual_train_eval_source_overlap": 0,
+    "residual_train_eval_normalized_query_overlap": 0
+  }
+}

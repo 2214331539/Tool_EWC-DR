@@ -8,7 +8,7 @@ from typing import Any
 
 from .evaluate import evaluate
 from .train import train
-from .utils import STAGES, load_config, load_json, project_root, resolve_path, save_json
+from .utils import load_config, load_json, project_root, protocol_stages, resolve_path, save_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,7 +63,7 @@ def run_validated_pipeline(
         row["stage"]: int(row["best_epoch"])
         for row in selection_summary.get("stages", [])
     }
-    expected_stages = tuple(config["training"].get("stages", STAGES))
+    expected_stages = tuple(config["training"].get("stages", protocol_stages(config)))
     if set(selected_epochs) != set(expected_stages) or any(value <= 0 for value in selected_epochs.values()):
         raise RuntimeError(f"Selection pass did not produce valid epochs for every stage: {selected_epochs}")
 

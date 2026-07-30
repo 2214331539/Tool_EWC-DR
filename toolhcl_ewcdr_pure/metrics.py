@@ -4,13 +4,13 @@ from typing import Any, Iterable
 
 import torch
 
-from .utils import EXPECTED_TOOL_COUNTS, STAGES
-
-
 METRIC_NAMES = ("Recall@1", "Recall@3", "Recall@5", "NDCG@1", "NDCG@3", "NDCG@5", "MRR")
-PREDICTION_STAGE_METRIC_NAMES = tuple(f"top1_pred_{stage}_percent" for stage in STAGES) + (
-    "top1_pred_checkpoint_stage_percent",
-)
+
+
+def prediction_stage_metric_names(stages: Iterable[str]) -> tuple[str, ...]:
+    return tuple(f"top1_pred_{stage}_percent" for stage in stages) + (
+        "top1_pred_checkpoint_stage_percent",
+    )
 
 
 class RetrievalMetrics:
@@ -34,7 +34,15 @@ class RetrievalMetrics:
         valid_logits = logits[valid, :candidate_count]
         valid_targets = targets[valid].long()
         gold_scores = valid_logits.gather(1, valid_targets.view(-1, 1))
-        ranks = (valid_logits > gold_scores).sum(dim=1).long() + 1
+        candidate_ids = torch.arange(candidate_count, device=valid_logits.device).view(1, -1)
+        ties_before_gold = (valid_logits == gold_scores) & (
+            candidate_ids < valid_targets.view(-1, 1)
+        )
+        ranks = (
+            (valid_logits > gold_scores).sum(dim=1)
+            + ties_before_gold.sum(dim=1)
+            + 1
+        ).long()
         for value in self.topk:
             hits = ranks <= value
             self.recall[value] += float(hits.sum().item())
@@ -57,16 +65,18 @@ class RetrievalMetrics:
 
 
 class PredictionStageMetrics:
-    def __init__(self) -> None:
+    def __init__(self, stages: Iterable[str], tool_counts: dict[str, int]) -> None:
+        self.stages = tuple(stages)
+        self.tool_counts = dict(tool_counts)
         self.samples = 0
-        self.counts = {stage: 0 for stage in STAGES}
+        self.counts = {stage: 0 for stage in self.stages}
 
     def update(self, logits: torch.Tensor, candidate_count: int) -> None:
         predictions = logits.detach()[:, :candidate_count].argmax(dim=1)
         self.samples += int(predictions.numel())
         lower = 0
-        for stage in STAGES:
-            upper = EXPECTED_TOOL_COUNTS[stage]
+        for stage in self.stages:
+            upper = self.tool_counts[stage]
             self.counts[stage] += int(((predictions >= lower) & (predictions < upper)).sum().item())
             lower = upper
 
@@ -74,7 +84,7 @@ class PredictionStageMetrics:
         denominator = max(1, self.samples)
         result = {
             f"top1_pred_{stage}_percent": self.counts[stage] / denominator * 100.0
-            for stage in STAGES
+            for stage in self.stages
         }
         result["top1_pred_checkpoint_stage_percent"] = result[f"top1_pred_{checkpoint_stage}_percent"]
         return result

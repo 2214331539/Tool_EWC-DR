@@ -28,7 +28,7 @@ from .model import (
     save_checkpoint,
 )
 from .train import classification_loss
-from .utils import EXPECTED_TOOL_COUNTS, STAGES, dataloader_options, load_config, resolve_device, save_json, set_seed
+from .utils import dataloader_options, load_config, protocol_stages, protocol_tool_counts, resolve_device, save_json, set_seed
 
 
 EFFECTIVE_FILES = ("data.py", "cache.py", "model.py", "ewcdr.py", "metrics.py", "train.py")
@@ -77,6 +77,8 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
         import_graph[filename] = imports
 
     records = load_stage_tools(config)
+    stages = protocol_stages(config)
+    tool_counts = protocol_tool_counts(config)
     synthetic_samples = [
         PureSample(f"query-{tool_id}-{sample_id}", tool_id, f"tool-{tool_id}", "api", "base")
         for tool_id in range(100)
@@ -89,14 +91,14 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
         raise AssertionError(f"Tool-coverage sampling verification failed: {sampling_report}")
     label_checks: dict[str, list[dict]] = {}
     rng = random.Random(42)
-    for stage in STAGES:
+    for stage in stages:
         samples, _ = build_stage_samples(config, stage, "train", records=records, max_samples=2000)
-        tools = visible_tools(stage, records)
+        tools = visible_tools(stage, records, config)
         mapping, _ = name_mapping(tools)
         chosen = rng.sample(samples, min(20, len(samples)))
         rows = []
         for sample in chosen:
-            assert 0 <= sample.tool_id < EXPECTED_TOOL_COUNTS[stage]
+            assert 0 <= sample.tool_id < tool_counts[stage]
             assert mapping[tool_key(sample.tool_name, sample.api_name)] == sample.tool_id
             rows.append({"tool_name": sample.tool_name, "api_name": sample.api_name, "tool_id": sample.tool_id})
         label_checks[stage] = rows
@@ -105,29 +107,32 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
     classification_objective_check: dict[str, float | int | str] = {}
     with tempfile.TemporaryDirectory(prefix="pure_ewcdr_verify_") as temporary:
         previous_path = None
-        for stage in STAGES:
+        for stage in stages:
             model = build_retriever(config, stage, encoder=None)
             names = list(named_trainable_parameters(model))
             if not names or any(not name.startswith(("query_projection.", "classifier.")) for name in names):
                 raise AssertionError(f"Unexpected trainable parameters for {stage}: {names}")
             if previous_path is not None:
-                initialize_from_previous(model, previous_path, stage, verify_exact=True)
+                initialize_from_previous(model, previous_path, stage, config=config, verify_exact=True)
             fake_hidden = torch.randn(2, int(config["model"]["hidden_size"]))
             logits = model.forward_hidden(fake_hidden)
-            expected_shape = (2, EXPECTED_TOOL_COUNTS[stage])
+            expected_shape = (2, tool_counts[stage])
             if tuple(logits.shape) != expected_shape:
                 raise AssertionError(f"{stage} logits {tuple(logits.shape)}, expected {expected_shape}")
             structure[stage] = {"trainable": names, "logits_shape": list(logits.shape)}
             previous_path = Path(temporary) / f"{stage}.pt"
             save_checkpoint(previous_path, model, stage=stage, epoch=0, training_history=[], metadata={"verification": True})
 
-        task1_model = build_retriever(config, "task1", encoder=None)
+        incremental_stage = stages[1]
+        old_count = tool_counts[stages[0]]
+        current_count = tool_counts[incremental_stage]
+        task1_model = build_retriever(config, incremental_stage, encoder=None)
         task1_logits = task1_model.forward_hidden(torch.randn(2, int(config["model"]["hidden_size"])))
-        task1_targets = torch.tensor([11112, 11751], dtype=torch.long)
+        task1_targets = torch.tensor([old_count, current_count - 1], dtype=torch.long)
         task1_loss, task1_candidates = classification_loss(task1_logits, task1_targets)
         task1_loss.backward()
-        old_grad = task1_model.classifier.weight.grad[:11112]
-        new_grad = task1_model.classifier.weight.grad[11112:]
+        old_grad = task1_model.classifier.weight.grad[:old_count]
+        new_grad = task1_model.classifier.weight.grad[old_count:]
         old_nonzero = int(torch.count_nonzero(old_grad).item())
         new_nonzero = int(torch.count_nonzero(new_grad).item())
         if old_nonzero == 0:
@@ -149,7 +154,7 @@ def verify(config_path: str, output_path: str | None = None) -> dict:
             hidden = model.encode([sample.query_text for sample in samples[:2]])
             full_logits = model.forward_hidden(hidden)
         assert tuple(hidden.shape) == (2, 4096)
-        assert tuple(full_logits.shape) == (2, 11112)
+        assert tuple(full_logits.shape) == (2, tool_counts[stages[0]])
         loader = make_loader(
             TextDataset(samples), batch_size=2, shuffle=False, **dataloader_options(config, "importance")
         )
