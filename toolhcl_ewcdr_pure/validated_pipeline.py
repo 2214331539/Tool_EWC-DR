@@ -17,6 +17,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--selection_dir", default=None)
     parser.add_argument("--method", choices=("seq_ft", "ewc", "ewc_dr"), default="ewc_dr")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override both the training seed and validation-split seed.",
+    )
     parser.add_argument("--keep_selection_checkpoints", action="store_true")
     return parser.parse_args()
 
@@ -41,8 +47,14 @@ def run_validated_pipeline(
     output_dir_value: str,
     selection_dir_value: str | None = None,
     method: str = "ewc_dr",
+    seed: int | None = None,
     keep_selection_checkpoints: bool = False,
 ) -> Path:
+    config = copy.deepcopy(config)
+    if seed is not None:
+        config["training"]["seed"] = seed
+        config["training"].setdefault("validation", {})["seed"] = seed
+
     root = project_root(config)
     output_dir = resolve_path(output_dir_value, root)
     selection_dir = resolve_path(selection_dir_value or f"{output_dir_value}_selection", root)
@@ -107,6 +119,7 @@ def main() -> None:
         output_dir_value=args.output_dir,
         selection_dir_value=args.selection_dir,
         method=args.method,
+        seed=args.seed,
         keep_selection_checkpoints=args.keep_selection_checkpoints,
     )
 

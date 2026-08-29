@@ -149,6 +149,18 @@ GPU_ID=0 \
 bash scripts/run_toolhcl_ewcdr_v2.sh
 ```
 
+三个独立随机种子的完整运行可以并行启动。`--seed` 会同时控制模型初始化、
+DataLoader/importance 采样和 tool-ID 分层验证划分；正式 eval split 与候选集保持不变：
+
+```bash
+PYTHON_BIN="$PWD/.venv/bin/python" \
+ARTIFACT_ROOT=/path/to/ewcdr_artifacts \
+SEEDS="42 43 44" GPU_IDS="0 1 2" \
+bash scripts/run_toolhcl_ewcdr_v2_multiseed.sh
+```
+
+也可以直接调用 `python -m toolhcl_ewcdr_pure.validated_pipeline --seed 43 ...`。
+
 未设置 `GPU_ID` 时脚本通过 `nvidia-smi` 选择满足显存和利用率阈值的 GPU。只重新评估现有运行：
 
 ```bash
