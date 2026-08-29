@@ -161,6 +161,14 @@ bash scripts/run_toolhcl_ewcdr_v2_multiseed.sh
 
 也可以直接调用 `python -m toolhcl_ewcdr_pure.validated_pipeline --seed 43 ...`。
 
+运行完成后可生成逐 seed 合并表和 mean/sample-std/min/max：
+
+```bash
+python scripts/summarize_toolhcl_ewcdr_v2_multiseed.py \
+  --run 42=/path/to/seed42 --run 43=/path/to/seed43 --run 44=/path/to/seed44 \
+  --output_dir /path/to/multiseed_results
+```
+
 未设置 `GPU_ID` 时脚本通过 `nvidia-smi` 选择满足显存和利用率阈值的 GPU。只重新评估现有运行：
 
 ```bash
