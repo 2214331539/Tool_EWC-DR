@@ -93,7 +93,7 @@ V2 的解析样本数：base/task1/task2/task3 train 为 `232982/13157/13932/129
 
 正式多 seed 实验使用 [`configs/toolhcl_ewcdr_v2_converged.yaml`](configs/toolhcl_ewcdr_v2_converged.yaml)：
 
-1. 每个 stage 使用 100% 原始 train split，至少训练 10 epochs，最多训练 30 epochs。
+1. 每个 stage 使用 100% 原始 train split，至少训练 10 epochs，最多训练 60 epochs；较高上限只用于避免尚未满足收敛条件时被截断。
 2. 每轮同时计算相邻 epoch 的 CE loss 和 total loss 相对变化率。
 3. 两个变化率的最大值连续 3 轮不超过 5% 后才停止，最早只能在第 10 epoch 停止。
 4. checkpoint 固定保存触发收敛时的最后一轮，不按 test 或每个 seed 的 validation 最佳点回退。

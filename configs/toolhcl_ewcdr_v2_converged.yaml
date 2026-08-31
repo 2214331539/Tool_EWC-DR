@@ -44,10 +44,10 @@ training:
   classification_scope: all_visible
   checkpoint_selection: last_epoch
   stage_epochs:
-    base: {min: 10, max: 30}
-    task1: {min: 10, max: 30}
-    task2: {min: 10, max: 30}
-    task3: {min: 10, max: 30}
+    base: {min: 10, max: 60}
+    task1: {min: 10, max: 60}
+    task2: {min: 10, max: 60}
+    task3: {min: 10, max: 60}
   validation:
     enabled: false
   early_stopping:
