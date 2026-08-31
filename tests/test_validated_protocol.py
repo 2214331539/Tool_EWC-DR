@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from toolhcl_ewcdr_pure.data import FeatureDataset, PureSample, stratified_train_validation_indices
-from toolhcl_ewcdr_pure.train import _evaluate_seen_validation
+from toolhcl_ewcdr_pure.train import _evaluate_seen_validation, _relative_loss_change
 
 
 class _IdentityLogitModel(torch.nn.Module):
@@ -18,6 +18,10 @@ class _IdentityLogitModel(torch.nn.Module):
 
 
 class ValidatedProtocolTest(unittest.TestCase):
+    def test_relative_loss_change_uses_previous_epoch_as_denominator(self):
+        self.assertAlmostEqual(_relative_loss_change(10.0, 9.5), 0.05)
+        self.assertAlmostEqual(_relative_loss_change(2.0, 2.2), 0.1)
+
     def test_stratified_split_is_deterministic_and_keeps_all_tools_in_train(self):
         samples = []
         for tool_id, count in ((0, 1), (1, 2), (2, 10), (3, 25)):

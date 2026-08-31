@@ -89,7 +89,20 @@ TOOLHCL_DATA_ROOT/
 
 V2 的解析样本数：base/task1/task2/task3 train 为 `232982/13157/13932/12989`，eval 为 `54348/3052/3206/3056`，global eval 共 `63662` 条。
 
-## Epoch 选择协议
+## 统一收敛协议
+
+正式多 seed 实验使用 [`configs/toolhcl_ewcdr_v2_converged.yaml`](configs/toolhcl_ewcdr_v2_converged.yaml)：
+
+1. 每个 stage 使用 100% 原始 train split，至少训练 10 epochs，最多训练 30 epochs。
+2. 每轮同时计算相邻 epoch 的 CE loss 和 total loss 相对变化率。
+3. 两个变化率的最大值连续 3 轮不超过 5% 后才停止，最早只能在第 10 epoch 停止。
+4. checkpoint 固定保存触发收敛时的最后一轮，不按 test 或每个 seed 的 validation 最佳点回退。
+5. base 不加 EWC；task1/task2/task3 保持 reversed-logits importance 和在线 EWC 正则不变。
+
+每轮日志和 `training_summary.json` 会记录 `relative_ce_loss_change`、
+`relative_total_loss_change`、`convergence_relative_change` 和 `stop_reason`，用于审计是否满足标准。
+
+## 历史验证选轮协议
 
 1. 对每个 stage train split 按 tool ID、seed 42 固定划分约 90% train 和 10% validation；单样本 tool 只留在 train。
 2. selection pass 最多训练 30 epochs。base 按自身 validation Recall@1 选轮次；增量阶段按“历史任务平均 Recall@1”和“当前任务 Recall@1”的调和均值选轮次。
@@ -98,6 +111,7 @@ V2 的解析样本数：base/task1/task2/task3 train 为 `232982/13157/13932/129
 5. 全量重训结束后才运行完整 seen-task matrix 和 global eval。
 
 seed 42 的已验证选择结果是 `base=7, task1=2, task2=1, task3=2`。
+该协议保留用于复核旧结果，不再用于正式多 seed 收敛实验。
 
 ## 安装和资产链接
 
@@ -159,6 +173,15 @@ SEEDS="42 43 44" GPU_IDS="0 1 2" \
 bash scripts/run_toolhcl_ewcdr_v2_multiseed.sh
 ```
 
+正式的统一 5% loss 收敛标准三 seed 运行：
+
+```bash
+PYTHON_BIN="$PWD/.venv/bin/python" \
+ARTIFACT_ROOT=/path/to/ewcdr_artifacts \
+SEEDS="42 43 44" GPU_IDS="0 1 2" \
+bash scripts/run_toolhcl_ewcdr_v2_converged_multiseed.sh
+```
+
 也可以直接调用 `python -m toolhcl_ewcdr_pure.validated_pipeline --seed 43 ...`。
 
 运行完成后可生成逐 seed 合并表和 mean/sample-std/min/max：
@@ -176,7 +199,8 @@ PYTHON_BIN="$PWD/.venv/bin/python" GPU_ID=0 \
 bash scripts/eval_toolhcl_ewcdr_v2.sh /path/to/run
 ```
 
-唯一正式配置为 [`configs/toolhcl_ewcdr_v2.yaml`](configs/toolhcl_ewcdr_v2.yaml)。
+正式收敛配置为 [`configs/toolhcl_ewcdr_v2_converged.yaml`](configs/toolhcl_ewcdr_v2_converged.yaml)；
+[`configs/toolhcl_ewcdr_v2.yaml`](configs/toolhcl_ewcdr_v2.yaml) 仅用于复核历史 validation-selected V2。
 
 ## 输出
 

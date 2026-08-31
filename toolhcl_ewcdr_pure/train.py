@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--importance_max_samples", type=int, default=None)
     parser.add_argument("--ewc_lambda", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -99,6 +100,8 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
         if args.ewc_lambda < 0:
             raise ValueError("--ewc_lambda must be non-negative")
         config["ewcdr"]["lambda"] = args.ewc_lambda
+    if args.seed is not None:
+        config["training"]["seed"] = args.seed
     if args.smoke:
         config["runtime"]["smoke"] = True
         config["training"]["stages"] = ["base", "task1"]
@@ -218,6 +221,10 @@ def _stage_epoch_limits(config: Mapping[str, Any], stage: str) -> tuple[int, int
 def _moving_average(history: list[dict[str, Any]], key: str, window: int) -> float:
     rows = history[-max(1, int(window)) :]
     return sum(float(row[key]) for row in rows) / len(rows)
+
+
+def _relative_loss_change(previous: float, current: float) -> float:
+    return abs(current - previous) / max(abs(previous), 1e-12)
 
 
 def _cache_regularizer(values: Mapping[str, torch.Tensor] | None, device: torch.device):
@@ -407,6 +414,12 @@ def train(config: dict[str, Any]) -> Path:
         window = int(early.get("window", 3))
         absolute_delta = float(early.get("absolute_min_delta", 0.001))
         relative_delta = float(early.get("relative_min_delta", 0.001))
+        convergence_criterion = str(early.get("criterion", "best_smoothed_loss"))
+        relative_change_threshold = float(early.get("relative_change_threshold", 0.05))
+        if convergence_criterion not in {"best_smoothed_loss", "consecutive_relative_change"}:
+            raise ValueError(f"Unsupported early-stopping criterion: {convergence_criterion}")
+        if not 0.0 < relative_change_threshold < 1.0:
+            raise ValueError("training.early_stopping.relative_change_threshold must be in (0, 1)")
         stale = 0
         best_smoothed_total = math.inf
         best_smoothed_ce = math.inf
@@ -476,6 +489,21 @@ def train(config: dict[str, Any]) -> Path:
                 "gpu_memory": gpu_memory_summary(),
                 **drift_summary(model, snapshot),
             }
+            if history:
+                row["relative_ce_loss_change"] = _relative_loss_change(
+                    float(history[-1]["ce_loss"]), float(row["ce_loss"])
+                )
+                row["relative_total_loss_change"] = _relative_loss_change(
+                    float(history[-1]["total_loss"]), float(row["total_loss"])
+                )
+                row["convergence_relative_change"] = max(
+                    float(row["relative_ce_loss_change"]),
+                    float(row["relative_total_loss_change"]),
+                )
+            else:
+                row["relative_ce_loss_change"] = None
+                row["relative_total_loss_change"] = None
+                row["convergence_relative_change"] = None
             if validation_enabled and (epoch + 1) % int(validation_config.get("eval_every", 1)) == 0:
                 validation_started = time.time()
                 row["validation"] = _evaluate_seen_validation(
@@ -538,6 +566,18 @@ def train(config: dict[str, Any]) -> Path:
                     stop_reason = (
                         "validation_converged(metric=harmonic_mean_historical_current_recall_at_1,"
                         f"patience={validation_patience},min_delta={validation_delta})"
+                    )
+                    break
+            elif not validation_enabled and convergence_criterion == "consecutive_relative_change":
+                change = row["convergence_relative_change"]
+                if change is not None and float(change) <= relative_change_threshold:
+                    stale += 1
+                else:
+                    stale = 0
+                if epoch + 1 >= minimum_epochs and stale >= patience:
+                    stop_reason = (
+                        "train_loss_relative_change_converged("
+                        f"patience={patience},threshold={relative_change_threshold})"
                     )
                     break
             elif not validation_enabled and len(history) >= window:
