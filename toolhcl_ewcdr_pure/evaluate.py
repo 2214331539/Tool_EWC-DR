@@ -182,16 +182,29 @@ def _write_summary(
         training.get("classification_scope", config.get("training", {}).get("classification_scope", "all_visible"))
     )
     lambda_ewc = float(config.get("ewcdr", {}).get("lambda", 0.0))
-    if classification_scope != "all_visible":
-        raise ValueError(f"V2 requires classification_scope=all_visible, got {classification_scope}")
-    scope_description = (
-        "Incremental CE uses every currently visible classifier row, so train-time logits and "
-        "task-agnostic inference candidates share the same global tool space."
-    )
-    deviation_description = (
-        "Incremental CE covers all visible tools instead of the original new-class slice. This is "
-        "an explicit ToolHCL retrieval adaptation."
-    )
+    if classification_scope not in {"all_visible", "current_stage", "current_stage_calibrated"}:
+        raise ValueError(f"Unsupported classification_scope={classification_scope}")
+    if classification_scope == "current_stage_calibrated":
+        scope_description = (
+            "Incremental CE is computed on the newly introduced tool rows and blended with a "
+            "deterministic class-ratio weighted all-visible calibration CE."
+        )
+        deviation_description = (
+            "The current-stage calibrated objective is used as an explicit ToolHCL retrieval "
+            "adaptation; evaluation still ranks every visible tool."
+        )
+    elif classification_scope == "current_stage":
+        scope_description = "Incremental CE uses only newly introduced tool rows."
+        deviation_description = "The new-class CE objective is used as an explicit ToolHCL retrieval adaptation."
+    else:
+        scope_description = (
+            "Incremental CE uses every currently visible classifier row, so train-time logits and "
+            "task-agnostic inference candidates share the same global tool space."
+        )
+        deviation_description = (
+            "Incremental CE covers all visible tools instead of the original new-class slice. This is "
+            "an explicit ToolHCL retrieval adaptation."
+        )
     importance_rows = _importance_rows(output_dir)
     importance_limit = config.get("ewcdr", {}).get("importance_max_samples")
     if importance_limit is None:

@@ -44,6 +44,7 @@ from .model import (
 )
 from .metrics import RetrievalMetrics
 from .utils import (
+    EXPECTED_OLD_TOOL_COUNTS,
     STAGES,
     autocast_context,
     dataloader_options,
@@ -236,9 +237,25 @@ def _cache_regularizer(values: Mapping[str, torch.Tensor] | None, device: torch.
 def classification_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
+    *,
+    first_class: int = 0,
+    global_ce_weight: float = 0.0,
 ) -> tuple[torch.Tensor, int]:
-    """Compute CE over every tool visible at the current continual stage."""
-    return F.cross_entropy(logits.float(), targets).float(), int(logits.shape[1])
+    """Compute current-stage CE with optional all-visible calibration."""
+    start = int(first_class)
+    if start < 0 or start >= int(logits.shape[1]):
+        raise ValueError(f"Invalid first_class={start} for {logits.shape[1]} logits")
+    if bool(torch.any(targets < start)) or bool(torch.any(targets >= logits.shape[1])):
+        raise ValueError(f"Targets must lie in [{start}, {logits.shape[1]})")
+    weight = float(global_ce_weight)
+    if weight < 0.0 or weight > 1.0:
+        raise ValueError(f"global_ce_weight must lie in [0, 1], got {weight}")
+    active_logits = logits[:, start:]
+    current_loss = F.cross_entropy(active_logits.float(), targets - start).float()
+    if start == 0 or weight == 0.0:
+        return current_loss, int(active_logits.shape[1])
+    global_loss = F.cross_entropy(logits.float(), targets).float()
+    return ((1.0 - weight) * current_loss + weight * global_loss).float(), int(logits.shape[1])
 
 
 def _materialize_feature_subset(dataset: FeatureDataset, indices: Sequence[int]) -> FeatureDataset:
@@ -320,8 +337,8 @@ def train(config: dict[str, Any]) -> Path:
     cache_root = resolve_path(config["cache"]["root"], root)
     method = str(config["ewcdr"].get("method", "ewc_dr"))
     classification_scope = str(config["training"].get("classification_scope", "all_visible"))
-    if classification_scope != "all_visible":
-        raise ValueError("V2 requires training.classification_scope=all_visible")
+    if classification_scope not in {"all_visible", "current_stage", "current_stage_calibrated"}:
+        raise ValueError(f"Unsupported training.classification_scope={classification_scope}")
     lambda_ewc = float(config["ewcdr"].get("lambda", 1000.0))
     gamma = float(config["ewcdr"].get("gamma", 1.0))
     resume = bool(config["runtime"].get("resume", False))
@@ -399,6 +416,25 @@ def train(config: dict[str, Any]) -> Path:
             raise AssertionError(f"Unexpected trainable parameters: {unexpected}")
         logger.info("stage=%s trainable=%s", stage, trainable_summary(model))
 
+        classification_first = (
+            int(EXPECTED_OLD_TOOL_COUNTS.get(stage, 0))
+            if classification_scope in {"current_stage", "current_stage_calibrated"}
+            else 0
+        )
+        global_ce_weight = 0.0
+        if classification_scope == "current_stage_calibrated" and classification_first > 0:
+            configured_weight = config["training"].get("global_ce_weight", "class_ratio")
+            if str(configured_weight).lower() == "class_ratio":
+                global_ce_weight = (model.num_tools - classification_first) / model.num_tools
+            else:
+                global_ce_weight = float(configured_weight)
+            if not 0.0 < global_ce_weight < 1.0:
+                raise ValueError(f"global_ce_weight must lie in (0, 1), got {global_ce_weight}")
+        logger.info(
+            "stage=%s CE classifier rows=[%s,%s) global_ce_weight=%.6f",
+            stage, classification_first, model.num_tools, global_ce_weight,
+        )
+
         loader = _loader(dataset, config, shuffle=True)
         optimizer = AdamW(
             named_trainable_parameters(model).values(),
@@ -444,7 +480,12 @@ def train(config: dict[str, Any]) -> Path:
                 with autocast_context(device, amp_enabled, amp_dtype):
                     logits = model.forward_batch(batch, device)
                 targets = batch["tool_id"].to(device, non_blocking=True)
-                ce_loss, classification_candidates = classification_loss(logits, targets)
+                ce_loss, classification_candidates = classification_loss(
+                    logits,
+                    targets,
+                    first_class=classification_first,
+                    global_ce_weight=global_ce_weight,
+                )
                 if stage_position == 0 or method == "seq_ft":
                     ewc_loss = torch.zeros((), device=device, dtype=torch.float32)
                 else:
@@ -483,6 +524,8 @@ def train(config: dict[str, Any]) -> Path:
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "classification_scope": classification_scope,
                 "classification_candidates": classification_candidates,
+                "classification_first_class": classification_first,
+                "global_ce_weight": global_ce_weight,
                 "batches": batches,
                 "samples": samples_seen,
                 "duration_sec": round(time.time() - epoch_started, 3),
